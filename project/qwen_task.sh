@@ -2,7 +2,8 @@
 # Hands one task from loop/TASKS.md to the local space-qwen model, run through Claude Code headless.
 # Usage: tools/qwen_task.sh <task-id> [feedback-file]
 # The feedback file holds the test failures from the last attempt, so qwen can fix them.
-# Phone messages: a progress message every PROGRESS_INTERVAL seconds (default 1200, 20 minutes), plus start, finish and
+# Phone messages: the first 2 progress messages come every EARLY_PROGRESS_INTERVAL seconds (default 240, 4 minutes), then
+# one every PROGRESS_INTERVAL seconds (default 1200, 20 minutes). Also start, finish and
 # failure messages. Every STUCK_CHECK_INTERVAL seconds (default 210, 3.5 minutes) it checks whether the log has grown.
 # If not, it sends a "may be stuck" alert at once, once per stall. They use the topic in
 # ~/.claude/hooks/ntfy-topic.txt. If that file is missing, nothing is sent.
@@ -13,6 +14,8 @@ TASK_ID="${1:?usage: qwen_task.sh <task-id> [feedback-file]}"
 FEEDBACK="${2:-}"
 CLAUDE="${CLAUDE_EXE:-claude}"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-1200}"
+EARLY_PROGRESS_INTERVAL="${EARLY_PROGRESS_INTERVAL:-240}"
+EARLY_PROGRESS_REPORTS=2
 STUCK_CHECK_INTERVAL="${STUCK_CHECK_INTERVAL:-210}"
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -63,9 +66,10 @@ start=$(date +%s)
 # Runs in the background, checking every 5 seconds which timer is due.
 # Stuck check (every STUCK_CHECK_INTERVAL): if the log has not grown since the last check, send one "may be stuck"
 # alert. It is not repeated until the log grows again.
-# Progress report (every PROGRESS_INTERVAL): one status message with the time, tool calls, last file and diff size.
+# Progress report: one status message with the time, tool calls, last file and diff size. The first
+# EARLY_PROGRESS_REPORTS come every EARLY_PROGRESS_INTERVAL, then every PROGRESS_INTERVAL.
 report_progress() {
-	local last_report=$start last_check=$start last_size=0 alerted=0 now size mins calls file diff msg
+	local last_report=$start last_check=$start last_size=0 alerted=0 reports=0 wait_for now size mins calls file diff msg
 	while sleep 5; do
 		now=$(date +%s)
 		if [ $(( now - last_check )) -ge "$STUCK_CHECK_INTERVAL" ]; then
@@ -81,8 +85,11 @@ report_progress() {
 			fi
 			last_size=$size
 		fi
-		if [ $(( now - last_report )) -ge "$PROGRESS_INTERVAL" ]; then
+		wait_for=$PROGRESS_INTERVAL
+		[ "$reports" -lt "$EARLY_PROGRESS_REPORTS" ] && wait_for=$EARLY_PROGRESS_INTERVAL
+		if [ $(( now - last_report )) -ge "$wait_for" ]; then
 			last_report=$now
+			reports=$(( reports + 1 ))
 			mins=$(( (now - start) / 60 ))
 			calls=$(grep -o '"type":"tool_use"' "$log" 2>/dev/null | wc -l)
 			file=$(grep -o '"file_path":"[^"]*"' "$log" 2>/dev/null | tail -n 1 | sed 's/.*[\\/]//; s/"$//')
