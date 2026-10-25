@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Hands one task from loop/TASKS.md to the local space-qwen model, run through Claude Code headless.
+# Hands one task from loop/TASKS.md to a local Ollama model, run through Claude Code headless.
 # Usage: tools/qwen_task.sh <task-id> [feedback-file]
 # The feedback file holds the test failures from the last attempt, so qwen can fix them.
 # Phone messages: the first 2 progress messages come every EARLY_PROGRESS_INTERVAL seconds (default 240, 4 minutes), then
-# one every PROGRESS_INTERVAL seconds (default 1200, 20 minutes). Also start, finish and
+# one every PROGRESS_INTERVAL seconds (default 600, 10 minutes). Also start, finish and
 # failure messages. Every STUCK_CHECK_INTERVAL seconds (default 210, 3.5 minutes) it checks whether the log has grown.
 # If not, it sends a "may be stuck" alert at once, once per stall. They use the topic in
 # ~/.claude/hooks/ntfy-topic.txt. If that file is missing, nothing is sent.
@@ -14,11 +14,17 @@ TASK_ID="${1:?usage: qwen_task.sh <task-id> [feedback-file]}"
 FEEDBACK="${2:-}"
 CLAUDE="${CLAUDE_EXE:-claude}"
 PROJECT_DIR="${PROJECT_DIR:-.}"
-PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-1200}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-}"
+PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-600}"
 EARLY_PROGRESS_INTERVAL="${EARLY_PROGRESS_INTERVAL:-240}"
 EARLY_PROGRESS_REPORTS=2
 STUCK_CHECK_INTERVAL="${STUCK_CHECK_INTERVAL:-210}"
 cd "$(dirname "$0")/../.." || exit 1
+
+if [ -z "$OLLAMA_MODEL" ]; then
+	echo "OLLAMA_MODEL must be set to the name of a model configured in Ollama"
+	exit 1
+fi
 
 if [ ! -d "$PROJECT_DIR" ]; then
 	echo "project directory does not exist: $PROJECT_DIR"
@@ -111,19 +117,17 @@ report_progress >> "loop/logs/$TASK_ID.notify.log" 2>&1 &
 reporter=$!
 trap 'kill "$reporter" 2>/dev/null' EXIT
 
-# The session is trimmed to fit qwen's 131K window (see loop/Modelfile). Claude Code's default system prompt and tool
-# list take about 21K tokens. Trimmed, they take about 4.6K. Each tool result adds to the prompt, and past the window
-# Ollama cuts the prompt without an error, so keep the task small.
+# Each tool result adds to the prompt, so keep the task small enough to fit the configured model's context window.
 # The env lines must run straight into the claude call. A comment inside the backslash chain ends the command, and
 # then claude gets no Ollama settings and calls Anthropic's API instead.
 ANTHROPIC_BASE_URL=http://localhost:11434 \
 ANTHROPIC_AUTH_TOKEN=ollama \
 ANTHROPIC_API_KEY= \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=space-qwen \
-ANTHROPIC_DEFAULT_SONNET_MODEL=space-qwen \
-ANTHROPIC_DEFAULT_OPUS_MODEL=space-qwen \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="$OLLAMA_MODEL" \
+ANTHROPIC_DEFAULT_SONNET_MODEL="$OLLAMA_MODEL" \
+ANTHROPIC_DEFAULT_OPUS_MODEL="$OLLAMA_MODEL" \
 "$CLAUDE" -p "$prompt" \
-	--model space-qwen \
+	--model "$OLLAMA_MODEL" \
 	--permission-mode acceptEdits \
 	--tools Bash,Read,Edit,Write,Glob,Grep \
 	--disable-slash-commands \

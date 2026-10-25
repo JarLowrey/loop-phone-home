@@ -14,7 +14,7 @@ worker model on a local Ollama server. Nothing here depends on Ollama. The hook 
 | `hook/phone.ps1` | `%USERPROFILE%\.claude\hooks\phone.ps1` | The hook. Reads Claude Code's event JSON on stdin and posts to ntfy. |
 | `hook/ntfy-topic.example.txt` | `%USERPROFILE%\.claude\hooks\ntfy-topic.txt` | Copy it, then replace the text with your own secret topic name. |
 | `hook/settings-hooks.example.json` | merged into `%USERPROFILE%\.claude\settings.json` | Registers the hook for `Notification` and `Stop`. |
-| `project/qwen_task.sh` | `<workspace>/<project-dir>/tools/qwen_task.sh` | Optional runner for the local `space-qwen` model. Sends task lifecycle and progress alerts through the same ntfy topic. |
+| `project/qwen_task.sh` | `<workspace>/<project-dir>/tools/qwen_task.sh` | Optional runner for a local Ollama model. Sends task lifecycle and progress alerts through the same ntfy topic. |
 
 No real topic name, token or personal path is in this folder. Replace every `YOU` and every placeholder below with
 your own values, and keep the real topic names out of git.
@@ -67,26 +67,27 @@ Anyone who knows a topic name can read it (alerts) or post to it (inbox). Treat 
    curl -s "https://ntfy.sh/${TOPIC}-inbox/json?poll=1&since=1h"
    ```
 
-## Install the Qwen task runner (optional)
+## Install the local model task runner (optional)
 
 This script does not replace the Claude Code hooks above; it adds start, periodic progress, stalled-run, finish, and
-failure alerts for headless `space-qwen` runs. It expects `loop/TASKS.md` at the workspace root and
+failure alerts for headless runs. It expects `loop/TASKS.md` at the workspace root and
 `tools/run_tests.sh` plus a `CLAUDE.md` in the target project directory. It reads the same alerts topic from
 `%USERPROFILE%\.claude\hooks\ntfy-topic.txt`.
 
 1. Copy `project/qwen_task.sh` to `<workspace>/<project-dir>/tools/qwen_task.sh`. From the workspace root in Git Bash,
    run `chmod +x <project-dir>/tools/qwen_task.sh`.
 2. Ensure `claude` is on the Git Bash `PATH`, or set `CLAUDE_EXE` to the Claude Code executable using a Git Bash path
-   (for example, `/c/Users/YOU/.../claude.exe`). The script also expects the local Ollama server at
-   `http://localhost:11434` with the `space-qwen` model configured.
+   (for example, `/c/Users/YOU/.../claude.exe`). The script expects a local Ollama server at
+   `http://localhost:11434`.
 3. From the workspace root in Git Bash, run
-   `PROJECT_DIR=<project-dir> <project-dir>/tools/qwen_task.sh <task-id> [feedback-file]`. `PROJECT_DIR` is relative to
-   the workspace root and defaults to `.`. The task id must identify a task heading in `loop/TASKS.md`. An optional
-   feedback file contributes its last 60 lines to the prompt.
+   `OLLAMA_MODEL=<model-name> PROJECT_DIR=<project-dir> <project-dir>/tools/qwen_task.sh <task-id> [feedback-file]`.
+   Set `OLLAMA_MODEL` to the name of a model configured in Ollama. `PROJECT_DIR` is relative to the workspace root and
+   defaults to `.`. The task id must identify a task heading in `loop/TASKS.md`. An optional feedback file contributes
+   its last 60 lines to the prompt.
 
 By default, lifecycle and progress notifications are sent to ntfy when the topic file exists. If it is missing, task
 execution continues without phone notifications. Set `QWEN_NOTIFY_DRY=1` to print notifications instead, or tune
-`PROGRESS_INTERVAL` (default 1200 seconds) and `STUCK_CHECK_INTERVAL` (default 210 seconds). Run
+`PROGRESS_INTERVAL` (default 600 seconds) and `STUCK_CHECK_INTERVAL` (default 210 seconds). Run
 `bash -n <project-dir>/tools/qwen_task.sh` from the workspace root to check shell syntax.
 
 ## The hook, step by step
