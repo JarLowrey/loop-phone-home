@@ -13,11 +13,18 @@ set -u
 TASK_ID="${1:?usage: qwen_task.sh <task-id> [feedback-file]}"
 FEEDBACK="${2:-}"
 CLAUDE="${CLAUDE_EXE:-claude}"
+PROJECT_DIR="${PROJECT_DIR:-.}"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-1200}"
 EARLY_PROGRESS_INTERVAL="${EARLY_PROGRESS_INTERVAL:-240}"
 EARLY_PROGRESS_REPORTS=2
 STUCK_CHECK_INTERVAL="${STUCK_CHECK_INTERVAL:-210}"
 cd "$(dirname "$0")/../.." || exit 1
+
+if [ ! -d "$PROJECT_DIR" ]; then
+	echo "project directory does not exist: $PROJECT_DIR"
+	exit 1
+fi
+test_script="$PROJECT_DIR/tools/run_tests.sh"
 
 TOPIC=""
 if [ -f "$HOME/.claude/hooks/ntfy-topic.txt" ]; then
@@ -45,10 +52,9 @@ if [ -z "$spec" ]; then
 	exit 1
 fi
 
-prompt="Do this task from loop/TASKS.md. Work in the space-game folder and change only what the task asks for.
-Follow CLAUDE.md: GDScript, tabs, class_name, one ## doc line per script and @export field, seeded randomness only,
-tests in tests/test_<thing>.gd. Never delete, skip or weaken a test. Never edit GoBlaster2.
-When the code is written, run ./space-game/tools/run_tests.sh and fix any FAIL lines.
+prompt="Do this task from loop/TASKS.md. Work in the $PROJECT_DIR directory and change only what the task asks for.
+Follow the project's CLAUDE.md instructions. Never delete, skip or weaken a test.
+When the code is written, run $test_script and fix any FAIL lines.
 Finish with the test summary line and the files you changed.
 
 $spec"
@@ -93,7 +99,7 @@ report_progress() {
 			mins=$(( (now - start) / 60 ))
 			calls=$(grep -o '"type":"tool_use"' "$log" 2>/dev/null | wc -l)
 			file=$(grep -o '"file_path":"[^"]*"' "$log" 2>/dev/null | tail -n 1 | sed 's/.*[\\/]//; s/"$//')
-			diff=$(git diff --stat -- space-game 2>/dev/null | tail -n 1)
+			diff=$(git diff --stat -- "$PROJECT_DIR" 2>/dev/null | tail -n 1)
 			msg="$TASK_ID: ${mins} min elapsed, $calls tool calls, last file ${file:-none}. ${diff:-no changes yet}"
 			notify "Qwen progress" "$msg" default
 		fi
@@ -122,8 +128,8 @@ ANTHROPIC_DEFAULT_OPUS_MODEL=space-qwen \
 	--tools Bash,Read,Edit,Write,Glob,Grep \
 	--disable-slash-commands \
 	--strict-mcp-config \
-	--system-prompt "You are a coding agent for a Godot 4.6 project. Read only the files the task names, and search with Grep before opening anything large." \
-	--allowedTools "Bash(./space-game/tools/run_tests.sh)" "Bash(ls:*)" "Bash(grep:*)" "Bash(cat:*)" \
+	--system-prompt "You are a coding agent. Follow the project's instructions, and search with Grep before opening anything large." \
+	--allowedTools "Bash($test_script)" "Bash(ls:*)" "Bash(grep:*)" "Bash(cat:*)" \
 	--output-format stream-json --verbose \
 	2>&1 | tee "$log"
 status=${PIPESTATUS[0]}
