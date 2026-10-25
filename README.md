@@ -14,6 +14,7 @@ worker model on a local Ollama server. Nothing here depends on Ollama. The hook 
 | `hook/phone.ps1` | `%USERPROFILE%\.claude\hooks\phone.ps1` | The hook. Reads Claude Code's event JSON on stdin and posts to ntfy. |
 | `hook/ntfy-topic.example.txt` | `%USERPROFILE%\.claude\hooks\ntfy-topic.txt` | Copy it, then replace the text with your own secret topic name. |
 | `hook/settings-hooks.example.json` | merged into `%USERPROFILE%\.claude\settings.json` | Registers the hook for `Notification` and `Stop`. |
+| `project/qwen_task.sh` | `space_game/space-game/tools/qwen_task.sh` | Optional runner for the local `space-qwen` model. Sends task lifecycle and progress alerts through the same ntfy topic. |
 
 No real topic name, token or personal path is in this folder. Replace every `YOU` and every placeholder below with
 your own values, and keep the real topic names out of git.
@@ -65,6 +66,27 @@ Anyone who knows a topic name can read it (alerts) or post to it (inbox). Treat 
    TOPIC=$(cat ~/.claude/hooks/ntfy-topic.txt)
    curl -s "https://ntfy.sh/${TOPIC}-inbox/json?poll=1&since=1h"
    ```
+
+## Install the Qwen task runner (optional)
+
+This script is for the `space_game` project that has `loop/TASKS.md`, `loop/Modelfile`, and
+`space-game/tools/run_tests.sh`. It does not replace the Claude Code hooks above; it adds start, periodic progress,
+stalled-run, finish, and failure alerts for headless `space-qwen` runs. It reads the same alerts topic from
+`%USERPROFILE%\.claude\hooks\ntfy-topic.txt`.
+
+1. Copy `project/qwen_task.sh` to `space_game/space-game/tools/qwen_task.sh`. From the project root in Git Bash, run
+   `chmod +x tools/qwen_task.sh`.
+2. Ensure `claude` is on the Git Bash `PATH`, or set `CLAUDE_EXE` to the Claude Code executable using a Git Bash path
+   (for example, `/c/Users/YOU/.../claude.exe`). The script also expects the local Ollama server at
+   `http://localhost:11434` with the `space-qwen` model configured.
+3. From the `space_game` project root in Git Bash, run `tools/qwen_task.sh <task-id> [feedback-file]`. The task id
+   must identify a task heading in `loop/TASKS.md`. An optional feedback file contributes its last 60 lines to the
+   prompt.
+
+By default, lifecycle and progress notifications are sent to ntfy when the topic file exists. If it is missing, task
+execution continues without phone notifications. Set `QWEN_NOTIFY_DRY=1` to print notifications instead, or tune
+`PROGRESS_INTERVAL` (default 1200 seconds) and `STUCK_CHECK_INTERVAL` (default 210 seconds). Run
+`bash -n tools/qwen_task.sh` from the project root to check shell syntax.
 
 ## The hook, step by step
 
