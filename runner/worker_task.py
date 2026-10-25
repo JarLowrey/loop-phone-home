@@ -61,7 +61,8 @@ DEFAULTS = {
     "logs_dir": "loop/logs",
     "inbox_seen_file": "loop/inbox-seen.txt",
     # phone
-    "topic_file": "~/.claude/hooks/ntfy-topic.txt",   # holds the alerts topic; the inbox is <topic>-inbox
+    "topic_file": "~/.claude/hooks/ntfy-topic.txt",   # holds the topic used for alerts
+    "inbox_topic_suffix": "",                         # empty uses the same topic; "-inbox" separates commands
     "ntfy_server": "https://ntfy.sh",
     # what the worker may change, and how to test it
     "scope": [],                           # required: path prefixes, relative to project_root, e.g. ["src/", "tests/"]
@@ -105,11 +106,14 @@ MODEL_ERROR_WORDS = ("issue with the selected model", "API Error")
 PROMPT_HEAD = """Do this task from {tasks_file}. Change only what the task asks for.
 Never delete, skip or weaken a test.
 Create and change files only under: {scope}. No debug scripts, summaries or notes anywhere else.
+Never cd: every path, in commands and in file tools, is from the project root.
 {project_rules}
 Run the tests only with this command, from the project root: {test_command}
-Do not run commands in the background. Fix any failures, then run the tests again. Do not report success until they
-report no failures.
-Finish with the totals line from the last test run and the list of files you changed. Nothing else.
+Do not run commands in the background. Fix any failures, then run the tests again.
+When a test run reports no failures, your work is done, and you must stop there. Do not run the tests again, do not run
+any other command, and do not restate or echo the results. Never print test results with a command yourself. Your next
+message must be your final reply, with no tool call in it: the totals line from that run, then the list of files you
+changed, and nothing else.
 """
 HELPER_PROMPT = """A smaller coding model (the worker) is working on a task and got stuck in a loop.
 It was stopped because it {reason}.
@@ -134,13 +138,15 @@ The worker's last actions (time, source, text):
 {recent}
 """
 # The same list the loop sends for MAN. Keep the loop prompt's copy in step with this one.
-COMMANDS_HELP = """Commands (any case):
+COMMANDS_HELP = """Commands (exact text, any case; ANSWER accepts text after its exact prefix):
 STATUS - progress report now
 MAN - this list
 STOP - end the loop after this tick
 PAUSE - start no new task until RESUME
 RESUME - carry on after PAUSE
-ANSWER: <text> - answer the last NEED_INPUT question"""
+ANSWER: <text> - answer the last NEED_INPUT question
+APPROVED: <text> - yes to the last NEED_INPUT question, or APPROVED: <task id> to commit a task waiting for you
+REJECTED: <text> - no to the last NEED_INPUT question, or REJECTED: <task id> to block a task waiting for you"""
 
 C = SimpleNamespace()   # the loaded configuration; set by configure()
 
@@ -185,6 +191,9 @@ def configure():
     C.notify_dry = os.environ.get("WORKER_NOTIFY_DRY", "0") == "1"
     C.final_tests = os.environ.get("WORKER_FINAL_TESTS", "1") != "0"
     C.topic = "".join(C.topic_path.read_text(encoding="utf-8").split()) if C.topic_path.exists() else ""
+    if not isinstance(C.inbox_topic_suffix, str):
+        sys.exit(f"config {path}: inbox_topic_suffix must be a string")
+    C.inbox_topic = C.topic + C.inbox_topic_suffix
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -211,10 +220,12 @@ def notify(log_path, title, body, priority="default"):
 
 def poll_inbox():
     """(id, text) for each message on the inbox topic in the last 10 minutes. Empty if there is no topic or no network."""
-    if not C.topic:
+    if not C.inbox_topic:
         return []
     try:
-        body = urllib.request.urlopen(f"{C.ntfy_server}/{C.topic}-inbox/json?poll=1&since=10m", timeout=20).read()
+        body = urllib.request.urlopen(
+            f"{C.ntfy_server}/{C.inbox_topic}/json?poll=1&since=10m", timeout=20
+        ).read()
     except Exception:
         return []
     messages = []
@@ -224,7 +235,10 @@ def poll_inbox():
         except ValueError:
             continue
         if event.get("event") == "message":
-            messages.append((event.get("id", ""), event.get("message", "")))
+            message_id = event.get("id")
+            if isinstance(message_id, str):
+                message = event.get("message")
+                messages.append((message_id, message if isinstance(message, str) else ""))
     return messages
 
 
@@ -395,12 +409,18 @@ Sort every problem into one of two lists:
 - MAJOR: the change does not do what the task asks, a rule in the documents above is broken, the logic is wrong, or a
   test hides a bug or was weakened. Passing tests is not enough: a change can pass its tests by breaking a rule.
 - MINOR: style, comments, naming, stale or redundant comments, small cleanups that do not change behaviour.
+- NOTES: anything outside this task. The task text wins over the documents: where it says to do something (for
+  example "leaves X at 0") or leaves work to a later task, doing exactly that is correct, not an issue. A gap the
+  task leaves goes here, for the person running the loop. The worker never sees NOTES, so never ask the worker,
+  under MAJOR or MINOR, to do more than the task, or to change files outside the scope paths.
 
 Reply in exactly this form, and nothing before it:
 MAJOR
 - file:line, what is wrong, which rule it breaks
 MINOR
 - file:line, what to change
+NOTES
+- what the task leaves open
 Write "- none" under a heading that has no items.
 
 The task:
@@ -444,7 +464,8 @@ def ask_helper(spec, tests, diff, recent, reason):
 
 
 def parse_review(text):
-    """Splits a review into (major, minor) item lists. A reply without the MAJOR/MINOR headers counts as one major issue."""
+    """Splits a review into (major, minor) item lists; NOTES are left out. A reply without the MAJOR/MINOR headers
+    counts as one major issue."""
     major, minor, section, saw_header = [], [], None, False
     for raw in text.splitlines():
         line = raw.strip()
@@ -454,6 +475,9 @@ def parse_review(text):
             continue
         if heading.startswith("MINOR"):
             section, saw_header = minor, True
+            continue
+        if heading.startswith("NOTES"):
+            section = None
             continue
         if section is None or not line or line[0] not in "-*•":
             continue
@@ -757,7 +781,7 @@ class Run:
         reports = 0
         while not stop.wait(5):
             now = time.time()
-            in_session = self.phase not in ("helper", "done")
+            in_session = self.phase not in ("helper", "checking", "review", "done")
             quiet = now - self.last_event
             if in_session and quiet >= C.stuck_check_interval:
                 if now - last_quiet_check >= C.stuck_check_interval:
@@ -796,11 +820,11 @@ class Run:
         for message_id, text in poll_inbox():
             if message_id in seen:
                 continue
-            command = text.strip().upper()
-            if command == "STATUS":
+            command = text.casefold()
+            if command == "status":
                 self.alert("Worker status", self.progress_text())
                 mark_seen(message_id)
-            elif command == "MAN":
+            elif command == "man":
                 self.alert("Commands", COMMANDS_HELP)
                 mark_seen(message_id)
 
@@ -861,6 +885,8 @@ def worker_env():
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": C.worker_model,
         "ANTHROPIC_DEFAULT_SONNET_MODEL": C.worker_model,
         "ANTHROPIC_DEFAULT_OPUS_MODEL": C.worker_model,
+        # Keeps a "cd" from carrying over to later commands, which put files in a nested folder.
+        "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1",
     })
     return env
 
@@ -919,6 +945,7 @@ def get_advice(run, spec):
 def finish(run, before, tests_before, spec, round_no):
     """Rule checks, the closing test run and the review for one round. Sets run.state. A review that rejects with
     rounds left sets review_rejected and keeps its text in run.review_feedback."""
+    run.set_phase("checking")
     new_paths = sorted(changed_paths() - before)
     out_of_scope = [p for p in new_paths if not in_scope(p)]
     tests_now = count_tests()
@@ -928,6 +955,9 @@ def finish(run, before, tests_before, spec, round_no):
         problems = []
         if out_of_scope:
             problems.append(f"changed files outside the scope paths: {', '.join(out_of_scope)}")
+            if any(len(p.split("/")) > 2 and p.split("/")[0] == p.split("/")[1] for p in out_of_scope):
+                problems.append("some paths repeat a folder name, such as x/x/...: a cd carried over, and the "
+                                "scope paths are relative to the project root")
         if tests_removed:
             problems.append(f"{tests_removed} tests fewer than before")
         run.script_note("rule check: " + "; ".join(problems))
@@ -965,7 +995,8 @@ def finish(run, before, tests_before, spec, round_no):
                       f"{run.task_id} finished after {took}: {totals}. Review round {round_no}: {summary}.{left}")
         elif round_no < C.max_review_rounds:
             run.state = "review_rejected"
-            run.review_feedback = text
+            run.review_feedback = ("MAJOR\n" + "".join(f"- {item}\n" for item in major or ["none"]) +
+                                   "MINOR\n" + "".join(f"- {item}\n" for item in minor or ["none"]))
             run.alert(f"Worker review round {round_no}: sent back",
                       f"{run.task_id}: the review found issues, so the worker tries again (round {round_no + 1} of "
                       f"{C.max_review_rounds}). {summary}", "high")
@@ -977,6 +1008,21 @@ def finish(run, before, tests_before, spec, round_no):
     else:
         run.state = "tests_failed"
         run.alert("Worker finished, tests fail", f"{run.task_id} finished after {took}: {totals}", "high")
+
+
+def run_with_help(run, prompt, raw, spec):
+    """Runs one worker session. While the worker loops, restarts it with the helper's advice (max_assists in the whole run)."""
+    session_prompt = prompt
+    while True:
+        code = run_session(run, session_prompt, raw)
+        if C.stop_flag.exists() or run.timed_out or not run.loop_stopped or run.assists >= C.max_assists:
+            return code
+        addition = get_advice(run, spec)
+        if not addition:
+            return code
+        session_prompt = prompt + addition
+        run.new_session()
+        run.script_note(f"session {run.session} starts with the helper's advice")
 
 
 def run_task(task_id, feedback):
@@ -1015,20 +1061,7 @@ def run_task(task_id, feedback):
             watcher = threading.Thread(target=run.watch, args=(stop,), daemon=True)
             watcher.start()
 
-            session_prompt = prompt
-            while True:
-                code = run_session(run, session_prompt, raw)
-                if C.stop_flag.exists() or run.timed_out or not run.loop_stopped or run.assists >= C.max_assists:
-                    break
-                addition = get_advice(run, spec)
-                if not addition:
-                    break
-                session_prompt = head + "\n" + spec + addition
-                run.new_session()
-                run.script_note(f"session {run.session} starts with the helper's advice")
-
-            stop.set()
-            watcher.join(timeout=10)
+            code = run_with_help(run, prompt, raw, spec)
 
             if C.stop_flag.exists():
                 C.stop_flag.unlink(missing_ok=True)
@@ -1066,11 +1099,13 @@ def run_task(task_id, feedback):
                                       f"{C.max_review_rounds}). Fix every MAJOR item. Fix the MINOR items where the fix "
                                       "is clear. Change nothing the review did not mention, and keep the tests passing."
                                       f"\n\nReview:\n{run.review_feedback}\n\nCurrent test output:\n{run.last_tests}")
-                    run_session(run, session_prompt, raw)
+                    run_with_help(run, session_prompt, raw, spec)
                     run.state = "running"
                 exit_code = 0 if run.state == "passed" else 1
                 if run.state == "running":
                     run.state = "finished"
+            stop.set()
+            watcher.join(timeout=10)
             write_status(run.status())
             return exit_code
         except KeyboardInterrupt:

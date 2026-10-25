@@ -16,23 +16,27 @@ Nothing in this folder names a project, a model, a path or a topic. Those come f
 
 ## Phone topics and secrets
 
-Two topics, both long random names that act as shared secrets:
+By default, alerts and commands use one long random topic name as a shared secret:
 
-- **Alerts topic:** the hook and the runner post here. You subscribe to it in the ntfy app.
-- **Inbox topic:** you post commands here from the ntfy app. The loop and the runner read it. The inbox name is the alerts
-  topic plus `-inbox`.
+- **Alerts:** the hook and runner post here.
+- **Commands:** you post here from the ntfy app, and the loop and runner poll it.
 
-Anyone who knows a topic name can read it (alerts) or post to it (inbox). Treat both names like passwords, and keep them
-out of git. The only file that holds the alerts topic is `~/.claude/hooks/ntfy-topic.txt`.
+Subscribe to that topic in the ntfy app. Anyone who knows the name can read alerts and post commands, so treat it like a
+password and keep it out of git. The only file that holds the topic is `~/.claude/hooks/ntfy-topic.txt`.
+
+To separate alerts and commands, set `inbox_topic_suffix` to `"-inbox"` in `worker.json`. The hook and runner continue
+to post alerts to the base topic; the loop and runner poll `<base-topic>-inbox`. Subscribe to both topics if you want to
+receive alerts and send commands from the app. You can use another suffix if needed.
 
 ## Setup
 
 1. **Install the ntfy app** on your phone and open it.
-2. **Make a random topic name** for alerts, for example in PowerShell:
+2. **Make a random topic name**, for example in PowerShell:
    `'worker-loop-' + -join ((1..16) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })`
-   Make a second one for the inbox, which the runner derives as `<name>-inbox`. Use names of at least 16 random characters.
-3. **Subscribe** to the alerts topic in the ntfy app. Subscribe to the inbox topic too, if you want to see your replies.
-4. **Create** `%USERPROFILE%\.claude\hooks\ntfy-topic.txt` with only the alerts topic name on one line. The hook and the
+   Use at least 16 random characters. For separate topics, set `inbox_topic_suffix` to `"-inbox"` in `worker.json`;
+   the inbox topic is derived from this name.
+3. **Subscribe** to the topic in the ntfy app. For separate topics, subscribe to the inbox too if you want to see replies.
+4. **Create** `%USERPROFILE%\.claude\hooks\ntfy-topic.txt` with only the topic name on one line. The hook and the
    runner trim it, so a trailing newline is fine. Use `hook/ntfy-topic.example.txt` as the model.
 5. **Copy the hook**: `hook/phone.ps1` to `%USERPROFILE%\.claude\hooks\phone.ps1`.
 6. **Register the hook** by merging `hook/settings-hooks.example.json` into `%USERPROFILE%\.claude\settings.json`.
@@ -46,10 +50,12 @@ out of git. The only file that holds the alerts topic is `~/.claude/hooks/ntfy-t
    ```
    echo '{"hook_event_name":"Stop","last_assistant_message":"I mention LOOP_DONE in prose."}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME/.claude/hooks/phone.ps1"
    ```
-8. **Test the inbox path.** Post `Test` to the inbox topic from the ntfy app, then read it back:
+8. **Test the inbox path.** Post `STATUS` to the topic from the ntfy app, then read it back (append the configured
+   `inbox_topic_suffix`, or nothing for the default same-topic setup):
    ```
    TOPIC=$(cat ~/.claude/hooks/ntfy-topic.txt)
-   curl -s "https://ntfy.sh/${TOPIC}-inbox/json?poll=1&since=1h"
+   INBOX_SUFFIX='' # set to -inbox when using separate topics
+   curl -s "https://ntfy.sh/${TOPIC}${INBOX_SUFFIX}/json?poll=1&since=1h"
    ```
 
 ## The hook, step by step
@@ -91,6 +97,8 @@ The runner gives one task at a time to a local model and watches it. Everything 
    - Timers and limits: `max_minutes`, `progress_interval`, `early_progress_interval`, `stuck_check_interval`,
      `loop_idle_minutes`, `max_assists`.
 3. `topic_file` points at the alerts topic file (default `~/.claude/hooks/ntfy-topic.txt`). If it is missing, nothing is sent.
+   `inbox_topic_suffix` defaults to an empty string, so alerts and commands use the same topic. Set it to `-inbox` (or
+   another suffix) to poll a separate commands topic.
 
 ### Run it
 
@@ -121,13 +129,19 @@ model server, the model, Claude Code or the task is missing, or if another run i
   `review_references`. It sorts its findings into major and minor issues. Round 1 sends the change back
   on major or minor issues, so the worker can tidy them. Rounds 2 and 3 send it back only on major issues.
   `max_review_rounds` (default 3) is the number of reviews in all. Each review is saved as `<id>-<n>.md`,
-  and each phone message carries a count of the issues and the first major ones.
+  and each phone message carries a count of the issues and the first major ones. A review can also list NOTES: gaps the
+  task leaves on purpose. They go to the loop's open questions and are never sent back to the worker.
+- **Loop help.** The helper advice in the first bullet applies to every worker session, review rounds included.
+- **Working directory.** The worker's shell is told to keep the project root as its working directory, and the prompt
+  says never to `cd`. A stray `cd` used to put files in a nested folder, such as `x/x/...`, which the scope check reports.
 - **Rules.** Files changed outside the scope paths, and fewer tests than before (when `test_count_glob` is set), trigger
   an alert.
 - **Time.** `max_minutes` ends a run that has gone on too long.
 - **Finish.** The script runs the test command itself, and reports the real totals, not the worker's claim.
-- **Inbox.** Every `inbox_poll_interval` seconds it reads the inbox. `STATUS` gets an immediate progress report, and `MAN`
-  gets the command list. Other commands are left unread for the loop.
+- **Inbox.** Every `inbox_poll_interval` seconds it reads the configured inbox topic. `STATUS` gets an immediate progress
+  report, and `MAN` gets the command list. Fixed command text is matched exactly, ignoring case; extra text or whitespace
+  is ignored. The parameterized `ANSWER: <text>`, `APPROVED: <text>` and `REJECTED: <text>` commands accept their text
+  after the exact prefix. Other commands are left unread for the loop.
 
 ### What lands in the logs folder
 
@@ -164,8 +178,12 @@ The template is the prompt for an orchestrating Claude loop that works through a
 the worker writes the code. The template uses only the config's names, so it works with any `worker.json`.
 
 Its steps, per iteration:
-0. Read the phone inbox and act on the six commands, in any case: `STATUS`, `MAN`, `STOP`, `PAUSE`, `RESUME` and
-   `ANSWER: <text>`. Anything else is noted and ignored.
+0. Read the configured phone inbox and act on the commands: fixed commands `STATUS`, `MAN`, `STOP`, `PAUSE` and
+   `RESUME` must match exactly, ignoring case; `ANSWER:`, `APPROVED:` and `REJECTED:` require their exact prefix,
+   ignoring case, followed by their text. Do not trim whitespace or accept extra text for fixed commands. A short
+   unrecognised message is noted as a possible typo and answered on the phone; a long one is skipped.
+   The loop also has a "Tasks waiting for you" step: a task whose tests pass but whose review still finds major issues
+   is parked as `[?]` and waits for `APPROVED:` or `REJECTED:`.
 1. Check whether a worker run is still going (`--status`). If so, wait.
 2. Clear leftovers (`--revert`) rather than building on half-finished work.
 3. Take the next open task from the queue.
@@ -178,10 +196,11 @@ the `<runner>` placeholder is the folder that holds `worker_task.py`.
 
 ## Security notes
 
-- **Topic names are secrets.** Anyone who knows the alerts topic can read the alerts. Anyone who knows the inbox topic can
-  send the six commands. Use names of at least 16 random characters, and never commit them.
-- **The whitelist limits damage, not exposure.** A stranger who learns the inbox name can pause, stop or answer the loop,
-  and can ask for a status report. Rotate the inbox name if you suspect a leak.
+- **Topic names are secrets.** With the default shared topic, anyone who knows its name can read alerts and send the commands. A separate inbox suffix splits the traffic, but is not an access-control boundary: on public `ntfy.sh`,
+  anyone who knows the base topic can guess a predictable suffix and send commands. Use names of at least 16 random
+  characters, and never commit them.
+- **The whitelist limits damage, not exposure.** A stranger who learns the topic used for commands can pause, stop or
+  answer the loop, and can ask for a status report. Rotate the base topic if you suspect a leak.
 - **ntfy.sh is a third party.** Alert text, up to 500 characters, passes through it. Keep secrets out of alerts. The hook
   sends the last assistant message, so loops should not print secrets. Self-host ntfy with access control if alerts may
   carry sensitive detail.
@@ -215,7 +234,9 @@ Two bugs found while building this, so they are not reintroduced:
 - [ ] A line-start `LOOP_DONE` produces a "Loop finished" alert.
 - [ ] A line-start `NEED_INPUT:` produces a "Loop needs a decision" alert at high priority.
 - [ ] A permission prompt produces a "Claude needs you" alert.
-- [ ] A test message on the inbox topic is returned by the poll URL.
+- [ ] A command posted to the configured inbox topic is returned by the poll URL.
+- [ ] The default empty `inbox_topic_suffix` polls the same topic used for alerts.
+- [ ] A fixed command with extra text or whitespace is ignored; case-only changes are accepted.
 - [ ] `worker_task.py --status` runs with a valid config and prints JSON or "no hand-off has run yet".
 - [ ] A first attempt refuses to start while a leftover change exists in the scope paths.
 - [ ] A run with a fake worker sends the start and finish messages and writes the readable log.

@@ -5,6 +5,7 @@
   "logs_dir": "loop/logs",
   "inbox_seen_file": "loop/inbox-seen.txt",
   "topic_file": "~/.claude/hooks/ntfy-topic.txt",
+  "inbox_topic_suffix": "",
   "scope": [
     "src/",
     "tests/"
