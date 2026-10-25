@@ -265,7 +265,7 @@ def write_status(status):
     """Writes the status file in one step, so a reader never sees half a file."""
     C.status_file.parent.mkdir(parents=True, exist_ok=True)
     temp = C.status_file.with_suffix(".tmp")
-    temp.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    temp.write_text(json.dumps(status, indent=2), encoding="utf-8", newline="\n")
     os.replace(temp, C.status_file)
 
 
@@ -509,8 +509,8 @@ def review_changes(run, spec, round_no):
     if error:
         return [], [], "", error
     text_out = text + "\n"
-    (C.logs / f"{run.task_id}-{round_no}.md").write_text(text_out, encoding="utf-8")
-    (C.logs / f"{run.task_id}.review.md").write_text(text_out, encoding="utf-8")
+    (C.logs / f"{run.task_id}-{round_no}.md").write_text(text_out, encoding="utf-8", newline="\n")
+    (C.logs / f"{run.task_id}.review.md").write_text(text_out, encoding="utf-8", newline="\n")
     run.note("helper", f"review round {round_no}:\n{text}")
     major, minor = parse_review(text)
     return major, minor, text, ""
@@ -934,7 +934,7 @@ def get_advice(run, spec):
         run.script_note(f"the helper gave no advice: {error}")
         run.alert("Helper failed", f"{run.task_id}: {error}", "high")
         return ""
-    (C.logs / f"{run.task_id}.helper-{run.assists}.md").write_text(advice + "\n", encoding="utf-8")
+    (C.logs / f"{run.task_id}.helper-{run.assists}.md").write_text(advice + "\n", encoding="utf-8", newline="\n")
     run.note("helper", advice)
     run.alert(f"{C.helper_model} advice for the worker", advice[:450])
     return (f"\n\nYour last session was stopped because you {run.loop_reasons[-1]}.\n"
@@ -1052,7 +1052,7 @@ def run_task(task_id, feedback):
     before = changed_paths()
     tests_before = count_tests()
     stop = threading.Event()
-    with open(run.raw_path, "w", encoding="utf-8") as raw, open(run.readable_path, "w", encoding="utf-8") as readable:
+    with open(run.raw_path, "w", encoding="utf-8", newline="\n") as raw, open(run.readable_path, "w", encoding="utf-8", newline="\n") as readable:
         run.readable = readable
         try:
             run.state = "running"
@@ -1167,7 +1167,7 @@ def revert():
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = C.logs / f"revert-{stamp}"
     backup.mkdir(parents=True, exist_ok=True)
-    (backup / "changes.patch").write_text(git("diff", "--", *C.scope_dirs), encoding="utf-8")
+    (backup / "changes.patch").write_text(git("diff", "--", *C.scope_dirs), encoding="utf-8", newline="\n")
     untracked = git("ls-files", "--others", "--exclude-standard", "--", *C.scope_dirs).splitlines()
     strays = [p for p in status.get("out_of_scope", []) if (C.project / p).exists() and p not in
               git("ls-files", "--", p).splitlines()]
