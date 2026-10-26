@@ -179,27 +179,47 @@ Each point below came from a real failure, and the code handles each one:
 ### The driver (`runner/driver.py`)
 
 The driver runs the open tasks in the task file one at a time, in code, with no orchestrating session. It reads the same
-`worker.json` as the worker, and it imports the worker for the config, the checks and the git helpers.
+`worker.json` as the worker, and it imports the worker for the config, the checks and the git helpers. Run it from the
+folder containing `worker.json`, or set `WORKER_CONFIG` to that file.
 
 ```
-python driver.py             Haiku alone does each task in one session, with tools and no review (the default)
+python driver.py             Haiku alone does each task in one session (the default)
 python driver.py --worker    the worker does each task (worker_task.py), and Haiku reviews it and sends it back
 python driver.py --shutdown  stops a running driver and its session, from the machine it runs on
+python check_driver.py       shows whether the driver is running, its current task, and the last five log lines
+python check_driver.py 20    shows the last 20 log lines instead
 ```
 
 Haiku alone uses the normal Claude login, with the tools `Bash, Read, Edit, Write, Glob, Grep`, and the git commands in
-`deny_tools` are refused. It has `haiku_turns` turns and `haiku_timeout` seconds. Its change then goes through the same
-checks as a worker run, and it is committed with a `Co-Authored-By` line for Haiku. That line is the constant
-`CO_AUTHOR_HAIKU` in `driver.py`: change it if your Haiku model's name is different.
+`deny_tools` are refused. It has `haiku_turns` turns and `haiku_timeout` seconds. Its change goes through the driver's
+checks and is committed with a `Co-Authored-By` line for Haiku. This mode does not review Haiku's work.
+
+A task whose text contains a line `**Who.** Opus ...` runs as a separate Opus task in either mode, instead of going
+through Haiku or the worker. It uses the `OPUS_MODEL` environment variable (default `opus`), high effort, and a
+per-task budget and time limit. Opus must follow the task's `**Done when.**` line; the driver checks those items and,
+if code changed, runs the same scope and test checks before committing. Add a `**Done when.**` line with checks in
+backticks, such as `file \`docs/PLAN.md\`` or `output \`3 tests passed\``, so the driver can verify completion.
+Opus task output is saved as `<id>.opus.md`.
+
+Milestone reviews are explicit queue tasks, not automatic triggers at a milestone boundary. To review each milestone,
+add an Opus task after its implementation tasks (for example, `M2-R`) that reviews and fixes the milestone, then an
+Opus task (for example, `M2-N`) that revises the next milestone's tasks against the code. Mark both with
+`**Who.** Opus`, list the files they may change, and give each a verifiable `**Done when.**` line. The driver runs
+these tasks in queue order and applies its normal scope and test checks before committing them. See the milestone
+workflow in [LOOP.md](C:/Users/james/OneDrive/Documents/ntfy-er/loop-template/LOOP.md).
 
 **Checks before a commit.** The driver does not take the worker's word for these:
 - nothing changed outside `scope` and the loop folder;
-- no test was removed (worker mode counts them, when `test_count_glob` is set);
+- in worker mode, no test was removed (when `test_count_glob` is set);
 - the test command runs again now, and its totals line shows no failures.
 
 A task that fails a check, or ends in a failing state, is reverted with a backup and marked `[!]`, and the reason goes in
 the progress file's Blocked section. In `--worker` mode a state listed in `retry_states` is first retried with the test
 output, up to `max_attempts`. A blocked task is not sent to the phone: the driver moves on, and the commit says why.
+
+If a Haiku or Opus session hits a Claude usage limit, the driver leaves the task open and sends an urgent phone alert.
+When the reset time is present in the error, it resumes four minutes after the limit resets; otherwise, send `RESUME`
+after usage is available. `python check_driver.py` shows the scheduled restart time when one is set.
 
 **Before a task starts** the scope must be clean. Leftover changes in the scope are saved and reverted. Changes outside
 the scope and the loop folder are never undone by the driver: it pauses and says so, so you can look first.
@@ -245,14 +265,16 @@ retry_states: tests_failed, failed, looped, timed_out, tests_did_not_run
 The commands are read every `poll_seconds`, including during a Haiku session, where a thread reads them. A message that is
 not a command is ignored. A short one is also logged in `driver.log`, in case it was a typo.
 
-**Files** in `logs_dir`: `driver.log` (what the driver did, in order), `driver.json` (paused, busy, the current task, and a
-heartbeat), `driver.pid`, `<id>.haiku.jsonl` and `<id>.haiku.md` (Haiku's stream and its final message), `<id>.feedback.txt`
-(the test output for a retry), `usage.jsonl` (one line per session), and `revert-<time>/` (what was undone, with a backup).
+**Files** in `logs_dir`: `driver.log` (what the driver did, in order), `driver.json` (paused, busy, the current task,
+heartbeat and any scheduled restart), `driver.pid`, `<id>.haiku.jsonl` and `<id>.haiku.md` (Haiku's stream and final
+message), `<id>.opus.jsonl` and `<id>.opus.md` (Opus task stream and final message), `<id>.feedback.txt` (the test
+output for a retry), `usage.jsonl` (one line per session), and `revert-<time>/` (what was undone, with a backup).
 
 **One driver per folder.** A second start refuses while the first one is still running, according to `driver.pid`.
 
-**Limits.** There is no dollar cap: the Haiku limits are turns and time. The driver does not handle `ANSWER`, `APPROVED`
-or `REJECTED`, or the orchestrator's `[?]` tasks. Haiku alone has no review, so the checks above are its only gate.
+**Limits.** Haiku is limited by turns and time. Opus tasks also have a per-task budget. The driver does not handle
+`ANSWER`, `APPROVED` or `REJECTED`, or the orchestrator's `[?]` tasks. Haiku-alone tasks are not peer-reviewed, so the
+driver's checks above are their gate.
 
 ## The loop template (`loop-template/LOOP.md`)
 
@@ -309,8 +331,10 @@ the `<runner>` placeholder is the folder that holds `worker_task.py`.
 | Run stops with `looped` | The helper's advice did not help twice | Read `<id>.helper-<n>.md`, improve the task text, and retry with feedback. |
 | Inbox message never handled | The loop is not running, or the message is not one of the commands | Check the progress file for the "ignored inbox message" note. |
 | "a driver is already running" | A driver from this folder is alive, or `driver.pid` is stale | Send `SHUTDOWN NOW`, or `python driver.py --shutdown`. If the pid in `driver.pid` is not a driver, delete the file. |
+| Driver appears stuck or you need its current state | Check the driver's process and recent log output | Run `python check_driver.py` (or `python check_driver.py 20` for more log lines). |
 | "Driver paused: ... changes are left over" | Uncommitted changes outside the scope, which the driver never undoes | Commit or revert them, then send RESUME. |
 | "Sync failed" | The push was rejected (for example, the remote moved on) or timed out | Fix the remote and push by hand. The commit is already local, and the driver never forces a push. |
+| "Loop stopped: session usage exhausted" | The Claude usage limit was reached during a Haiku or Opus task | Wait for the scheduled restart, or send RESUME once usage is available. If no restart time is shown, send RESUME manually. |
 | Phone gets no alert from the worker | The title is not in `phone_titles` | Add it to `phone_titles`, or set `notify_all`. The alert is still in `<id>.notify.log`. |
 
 Two bugs found while building this, so they are not reintroduced:

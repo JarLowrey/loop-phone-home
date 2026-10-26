@@ -30,6 +30,21 @@ retry_states: tests_failed, failed, looped, timed_out, tests_did_not_run
   the test output; any other state blocks the task. The default Haiku-alone mode runs one session per task and blocks
   a failed one at once.
 
+## Milestone reviews with Opus
+
+The driver does not infer milestone boundaries. When planning the task queue, put two explicit Opus tasks after each
+milestone and before the next milestone's implementation tasks:
+
+1. `M<n>-R`: Opus reviews the completed milestone against the design and later milestones, fixes issues it finds, and
+   writes a review report.
+2. `M<n>-N`: Opus revises the next milestone's task descriptions to match the code and review, then writes a short
+   report of the task changes.
+
+Mark each entry with `**Who.** Opus` so `driver.py` runs it with Opus rather than Haiku or the worker. Give each task a
+`**Done when.**` line with verifiable `file`, `test` or `output` items in backticks. List all files it may change in
+the task. The driver checks the task's Done when items, scope and tests before committing; a failed check reverts and
+blocks the task. Without these queue entries, no milestone review or next-milestone revision runs automatically.
+
 ## Each iteration: up to 3 tasks, then wake again
 
 0. **Phone inbox.** Read the topic named in `~/.claude/hooks/ntfy-topic.txt`. By default, poll that same topic:
