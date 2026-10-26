@@ -33,8 +33,9 @@ Logs, in <logs_dir>:
   <id>.helper-<n>.md  the helper's advice, one file per loop
   <id>.notify.log     every phone message sent
 
-Phone messages go to the topic named in topic_file. Nothing is sent if that file is missing. While a run is going, the
-inbox commands STATUS and MAN (any case) are answered; other commands are left for the orchestrating loop.
+Phone messages go to the topic named in topic_file. Nothing is sent if that file is missing. Alerts reach the phone only
+when their title is in phone_titles. While a run is going, the inbox commands STATUS and MAN (any case) are answered,
+unless WORKER_UNDER_DRIVER=1 is set: driver.py sets it, and answers every command itself.
 
 Environment overrides: WORKER_CONFIG (config path), WORKER_MODEL (worker model), CLAUDE_EXE (Claude Code path),
 WORKER_NOTIFY_DRY=1 (print messages instead of sending), and for testing this script: WORKER_FINAL_TESTS=0 (skip its
@@ -84,7 +85,7 @@ DEFAULTS = {
     "helper_model": "haiku",
     "helper_timeout": 600,
     "max_assists": 2,
-    "max_review_rounds": 3,                       # reviews in all; round 1 also sends back minor issues
+    "max_review_rounds": 2,                       # reviews in all; round 1 also sends back minor issues
     "review_references": ["CLAUDE.md", "loop/DESIGN.md"],   # the documents the reviewer checks against
     # limits and timers, in seconds unless the name says minutes
     "max_minutes": 60,
@@ -95,6 +96,24 @@ DEFAULTS = {
     "loop_idle_minutes": 15,
     "gpu_busy_percent": 20,
     "inbox_poll_interval": 60,
+    # git commands a worker session may not run: they change files or the index
+    "deny_tools": ["Bash(git restore:*)", "Bash(git checkout:*)", "Bash(git reset:*)", "Bash(git stash:*)",
+                   "Bash(git clean:*)", "Bash(git rm:*)", "Bash(git mv:*)", "Bash(git switch:*)",
+                   "Bash(git add:*)", "Bash(git commit:*)"],
+    # the only alerts that reach the phone; notify_all sends every alert
+    "phone_titles": ["Worker may be stuck", "Worker blocked", "Worker model error", "Worker hand-off error",
+                     "Worker run not started"],
+    "notify_all": False,
+    "usage_log": "usage.jsonl",            # one line per worker session and per helper call, in logs_dir
+    # the driver (driver.py) reads these
+    "loop_file": "loop/LOOP.md",           # holds the driver-settings block
+    "progress_file": "loop/PROGRESS.md",   # the log: a table row per task, and a Blocked section
+    "open_task_pattern": r"^### \[ \] (\S+) (.*)$",   # two groups: the id and the title of the first open task
+    "rules_file": "CLAUDE.md",             # the project rules, given to the driver's Haiku session
+    "haiku_brief": "a software project",  # one line about the project, for Haiku's prompt
+    "sync": False,                         # the driver pushes the branch after each commit it makes: set true to push
+    "haiku_turns": 40,
+    "haiku_timeout": 1800,
 }
 REQUIRED = ("scope", "test_command", "worker_model")
 
@@ -137,16 +156,10 @@ What the worker has changed so far (git diff of the scope paths; new untracked f
 The worker's last actions (time, source, text):
 {recent}
 """
-# The same list the loop sends for MAN. Keep the loop prompt's copy in step with this one.
-COMMANDS_HELP = """Commands (exact text, any case; ANSWER accepts text after its exact prefix):
+# The answer to MAN when the worker runs on its own. Under driver.py, the driver's own list is sent instead.
+COMMANDS_HELP = """Commands (any case, the whole message):
 STATUS - progress report now
-MAN - this list
-STOP - end the loop after this tick
-PAUSE - start no new task until RESUME
-RESUME - carry on after PAUSE
-ANSWER: <text> - answer the last NEED_INPUT question
-APPROVED: <text> - yes to the last NEED_INPUT question, or APPROVED: <task id> to commit a task waiting for you
-REJECTED: <text> - no to the last NEED_INPUT question, or REJECTED: <task id> to block a task waiting for you"""
+MAN - this list"""
 
 C = SimpleNamespace()   # the loaded configuration; set by configure()
 
@@ -181,7 +194,7 @@ def configure():
     C.tasks = Path(settings["tasks_file"]) if Path(settings["tasks_file"]).is_absolute()         else C.project / settings["tasks_file"]
     C.logs = C.project / settings["logs_dir"]
     C.inbox_seen = C.project / settings["inbox_seen_file"]
-    C.topic_path = Path(settings["topic_file"]).expanduser()
+    C.topic_path = resolve(settings["topic_file"])
     C.status_file = Path(os.environ.get("WORKER_STATUS_FILE", C.logs / "worker-run.json"))
     C.stop_flag = C.status_file.with_suffix(".stop")   # --stop leaves it, so the run knows the end was asked for
     C.scope = tuple(p.replace("\\", "/") for p in settings["scope"])
@@ -199,8 +212,9 @@ def configure():
 # ---------------------------------------------------------------------------------------------------------------------
 # Small helpers: phone, inbox, status file, processes, git
 
-def notify(log_path, title, body, priority="default"):
-    """Sends one phone message, and records it in the notify log. Failures never stop the run."""
+def notify(log_path, title, body, priority="default", force=False):
+    """Sends one phone message, and records it in the notify log. Only titles in phone_titles reach the phone, unless
+    force is set (the answers to commands) or notify_all is on. Failures never stop the run."""
     if log_path:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as record:
@@ -208,7 +222,7 @@ def notify(log_path, title, body, priority="default"):
     if C.notify_dry:
         print(f"[notify] {title} | {body}", flush=True)
         return
-    if not C.topic:
+    if not C.topic or (not force and not C.notify_all and title not in C.phone_titles):
         return
     request = urllib.request.Request(f"{C.ntfy_server}/{C.topic}", data=body[:500].encode("utf-8"),
                                      headers={"Title": title, "Priority": priority}, method="POST")
@@ -434,6 +448,17 @@ New files in the scope paths (names only):
 """
 
 
+def log_usage(record):
+    """Appends one line to logs_dir/usage_log: the time and token use of one session or one helper call."""
+    record = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "task": CURRENT_TASK["id"], **record}
+    C.logs.mkdir(parents=True, exist_ok=True)
+    with open(C.logs / C.usage_log, "a", encoding="utf-8") as usage:
+        usage.write(json.dumps(record) + "\n")
+
+
+CURRENT_TASK = {"id": ""}
+
+
 def call_helper(prompt):
     """Runs the helper model with read-only tools on a prompt. Returns (text, error); one of them is empty."""
     # The prompt goes in on stdin: on the command line a large diff passes the Windows length limit
@@ -451,6 +476,10 @@ def call_helper(prompt):
         result = json.loads(done.stdout)
     except ValueError:
         return "", f"the helper's output was not JSON: {(done.stdout or done.stderr)[:300]}"
+    log_usage({"who": "helper", "kind": "review" if prompt.startswith("A worker model finished") else "advice",
+               "is_error": bool(result.get("is_error")), "turns": result.get("num_turns"),
+               "seconds": round((result.get("duration_ms") or 0) / 1000), "cost_usd": result.get("total_cost_usd"),
+               "usage": result.get("usage")})
     if result.get("is_error") or not result.get("result"):
         return "", f"the helper reported an error: {str(result.get('result'))[:300]}"
     return str(result["result"]).strip(), ""
@@ -593,6 +622,7 @@ class Run:
         self.assists = 0
         self.loop_reasons = []
         self.review_feedback = ""
+        self.usage = {}
         self.last_tests = ""
         self.result = {}
         self.new_session()
@@ -625,8 +655,8 @@ class Run:
         self.note("script", message)
         print(f"[script] {message}", flush=True)
 
-    def alert(self, title, body, priority="default"):
-        notify(self.notify_path, title, body, priority)
+    def alert(self, title, body, priority="default", force=False):
+        notify(self.notify_path, title, body, priority, force)
 
     def recent_lines(self, count=80):
         with self.lock:
@@ -660,6 +690,8 @@ class Run:
             self.note("claude-code", line)
             return True
         kind, subtype = event.get("type"), event.get("subtype")
+        if kind == "assistant" and event.get("message", {}).get("usage"):
+            self.usage[event["message"].get("id")] = event["message"]["usage"]
         if kind == "system" and subtype == "thinking_tokens":
             if not self.thinking_burst:
                 self.burst_start = time.time()
@@ -811,21 +843,22 @@ class Run:
                 self.alert("Worker progress", self.progress_text())
             if now - last_inbox >= C.inbox_poll_interval:
                 last_inbox = now
-                self.handle_inbox()
+                if not os.environ.get("WORKER_UNDER_DRIVER"):   # the driver answers the inbox when it runs the worker
+                    self.handle_inbox()
             write_status(self.status())
 
     def handle_inbox(self):
-        """Answers STATUS and MAN from the phone inbox. Other commands are left unread for the loop to handle."""
+        """Answers STATUS and MAN from the phone inbox. Other messages are left unread for whoever runs the worker."""
         seen = read_seen()
         for message_id, text in poll_inbox():
             if message_id in seen:
                 continue
-            command = text.casefold()
+            command = " ".join(text.split()).casefold()
             if command == "status":
-                self.alert("Worker status", self.progress_text())
+                self.alert("Worker status", self.progress_text(), force=True)
                 mark_seen(message_id)
             elif command == "man":
-                self.alert("Commands", COMMANDS_HELP)
+                self.alert("Commands", COMMANDS_HELP, force=True)
                 mark_seen(message_id)
 
 
@@ -871,6 +904,7 @@ def worker_command():
         "--strict-mcp-config",
         "--system-prompt", C.system_prompt,
         "--allowedTools", *C.allowed_tools,
+        *(["--disallowedTools", *C.deny_tools] if C.deny_tools else []),
         "--output-format", "stream-json", "--verbose",
     ]
 
@@ -893,6 +927,9 @@ def worker_env():
 
 def run_session(run, prompt, raw):
     """One Claude Code session for the worker. Returns its exit code."""
+    usage_before = set(run.usage)
+    tools_before = run.tool_calls
+    started = time.time()
     extra = {} if os.name == "nt" else {"start_new_session": True}   # its own process group, so --stop ends it all
     proc = subprocess.Popen(worker_command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             env=worker_env(), cwd=C.project, text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -917,6 +954,11 @@ def run_session(run, prompt, raw):
     if reader.is_alive():
         run.script_note("output pipe still open 60 s after the worker exited; carrying on")
     run.end_burst()
+    messages = [run.usage[key] for key in run.usage if key not in usage_before]
+    log_usage({"who": "worker", "kind": "session", "session": run.session, "seconds": round(time.time() - started),
+               "tool_calls": run.tool_calls - tools_before, "messages": len(messages),
+               "input_tokens": sum(m.get("input_tokens", 0) for m in messages),
+               "output_tokens_reported": sum(m.get("output_tokens", 0) for m in messages), "exit_code": code})
     run.script_note(f"session {run.session}: the worker exited with {code} after "
                     f"{minutes_text(time.time() - run.start)}")
     return code

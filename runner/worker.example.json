@@ -31,9 +31,27 @@
   "early_progress_interval": 240,
   "stuck_check_interval": 210,
   "loop_idle_minutes": 15,
-  "max_review_rounds": 3,
+  "max_review_rounds": 2,
   "review_references": [
     "CLAUDE.md",
     "docs/DESIGN.md"
-  ]
+  ],
+  "deny_tools": [
+    "Bash(git restore:*)", "Bash(git checkout:*)", "Bash(git reset:*)", "Bash(git stash:*)",
+    "Bash(git clean:*)", "Bash(git rm:*)", "Bash(git mv:*)", "Bash(git switch:*)",
+    "Bash(git add:*)", "Bash(git commit:*)"
+  ],
+  "phone_titles": [
+    "Worker may be stuck", "Worker blocked", "Worker model error", "Worker hand-off error", "Worker run not started"
+  ],
+  "notify_all": false,
+  "usage_log": "usage.jsonl",
+  "loop_file": "loop/LOOP.md",
+  "progress_file": "loop/PROGRESS.md",
+  "open_task_pattern": "^### \\[ \\] (\\S+) (.*)$",
+  "rules_file": "CLAUDE.md",
+  "haiku_brief": "a software project",
+  "sync": false,
+  "haiku_turns": 40,
+  "haiku_timeout": 1800
 }

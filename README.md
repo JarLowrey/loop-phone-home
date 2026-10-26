@@ -96,6 +96,8 @@ The runner gives one task at a time to a local model and watches it. Everything 
      reviewer checks it against.
    - Timers and limits: `max_minutes`, `progress_interval`, `early_progress_interval`, `stuck_check_interval`,
      `loop_idle_minutes`, `max_assists`.
+   - Driver keys, used by `driver.py` (see its section below): `loop_file`, `progress_file`, `open_task_pattern`,
+     `rules_file`, `haiku_brief`, `sync`, `haiku_turns`, `haiku_timeout`, `deny_tools`, `usage_log`.
 3. `topic_file` points at the alerts topic file (default `~/.claude/hooks/ntfy-topic.txt`). If it is missing, nothing is sent.
    `inbox_topic_suffix` defaults to an empty string, so alerts and commands use the same topic. Set it to `-inbox` (or
    another suffix) to poll a separate commands topic.
@@ -127,8 +129,8 @@ model server, the model, Claude Code or the task is missing, or if another run i
   (saved as `<id>.helper-<n>.md`). The worker restarts with that advice, up to `max_assists` times.
 - **Review.** After the tests pass, a helper model checks the change against the task and the documents in
   `review_references`. It sorts its findings into major and minor issues. Round 1 sends the change back
-  on major or minor issues, so the worker can tidy them. Rounds 2 and 3 send it back only on major issues.
-  `max_review_rounds` (default 3) is the number of reviews in all. Each review is saved as `<id>-<n>.md`,
+  on major or minor issues, so the worker can tidy them. Later rounds send it back only on major issues.
+  `max_review_rounds` (default 2) is the number of reviews in all. Each review is saved as `<id>-<n>.md`,
   and each phone message carries a count of the issues and the first major ones. A review can also list NOTES: gaps the
   task leaves on purpose. They go to the loop's open questions and are never sent back to the worker.
 - **Loop help.** The helper advice in the first bullet applies to every worker session, review rounds included.
@@ -138,10 +140,12 @@ model server, the model, Claude Code or the task is missing, or if another run i
   an alert.
 - **Time.** `max_minutes` ends a run that has gone on too long.
 - **Finish.** The script runs the test command itself, and reports the real totals, not the worker's claim.
-- **Inbox.** Every `inbox_poll_interval` seconds it reads the configured inbox topic. `STATUS` gets an immediate progress
-  report, and `MAN` gets the command list. Fixed command text is matched exactly, ignoring case; extra text or whitespace
-  is ignored. The parameterized `ANSWER: <text>`, `APPROVED: <text>` and `REJECTED: <text>` commands accept their text
-  after the exact prefix. Other commands are left unread for the loop.
+- **Phone alerts.** Only the titles in `phone_titles` reach the phone: the alerts that need a person (stuck, blocked, model
+  error, hand-off error, run not started). `notify_all` sends every alert. All of them are written to `<id>.notify.log`.
+- **Inbox.** When it runs alone, it reads the configured inbox topic every `inbox_poll_interval` seconds. `STATUS` gets an
+  immediate progress report, and `MAN` gets the command list. A message is matched after its case and spaces are
+  normalised, so `status` counts, but extra words do not. Other messages are left unread. Under `driver.py` the driver
+  answers the inbox instead, and the worker stays quiet on it (`WORKER_UNDER_DRIVER=1`).
 
 ### What lands in the logs folder
 
@@ -172,10 +176,91 @@ Each point below came from a real failure, and the code handles each one:
 - **The model server is checked before a run starts,** and a missing model is reported by name, not as a confusing failure
   in the middle of the run.
 
+### The driver (`runner/driver.py`)
+
+The driver runs the open tasks in the task file one at a time, in code, with no orchestrating session. It reads the same
+`worker.json` as the worker, and it imports the worker for the config, the checks and the git helpers.
+
+```
+python driver.py             Haiku alone does each task in one session, with tools and no review (the default)
+python driver.py --worker    the worker does each task (worker_task.py), and Haiku reviews it and sends it back
+python driver.py --shutdown  stops a running driver and its session, from the machine it runs on
+```
+
+Haiku alone uses the normal Claude login, with the tools `Bash, Read, Edit, Write, Glob, Grep`, and the git commands in
+`deny_tools` are refused. It has `haiku_turns` turns and `haiku_timeout` seconds. Its change then goes through the same
+checks as a worker run, and it is committed with a `Co-Authored-By` line for Haiku. That line is the constant
+`CO_AUTHOR_HAIKU` in `driver.py`: change it if your Haiku model's name is different.
+
+**Checks before a commit.** The driver does not take the worker's word for these:
+- nothing changed outside `scope` and the loop folder;
+- no test was removed (worker mode counts them, when `test_count_glob` is set);
+- the test command runs again now, and its totals line shows no failures.
+
+A task that fails a check, or ends in a failing state, is reverted with a backup and marked `[!]`, and the reason goes in
+the progress file's Blocked section. In `--worker` mode a state listed in `retry_states` is first retried with the test
+output, up to `max_attempts`. A blocked task is not sent to the phone: the driver moves on, and the commit says why.
+
+**Before a task starts** the scope must be clean. Leftover changes in the scope are saved and reverted. Changes outside
+the scope and the loop folder are never undone by the driver: it pauses and says so, so you can look first.
+
+**Commit and sync.** After a pass, the driver commits the scope, the task file and the progress file. If `sync` is true
+(the default is false) it then runs `git push origin HEAD`. It never forces a push. If the push fails, the commit stays local and the phone gets a
+"Sync failed" message.
+
+**Loop settings.** The loop file (`loop_file`) holds a `driver-settings` block. The driver reads it at every pass, so a
+change takes effect without a restart:
+
+```driver-settings
+poll_seconds: 60
+max_attempts: 3
+retry_states: tests_failed, failed, looped, timed_out, tests_did_not_run
+```
+
+**Phone messages.** The driver sends these whatever `phone_titles` says:
+
+| Title | When |
+|---|---|
+| Committed | a task passed and was committed |
+| Loop finished | no open task is left; send RESUME after you add some |
+| Driver paused | a task could not start because of changes left from an earlier run |
+| Sync failed | the push was rejected or timed out |
+| Loop status, Commands | the answers to STATUS and MAN |
+| Loop paused, Loop resumed | STOP or PAUSE, RESUME or RESTART |
+| Loop will exit, Loop exited | WIND DOWN |
+| Loop shutting down | SHUTDOWN NOW |
+| Loop driver crashed | the driver stopped on an error (urgent) |
+
+**Phone commands.** Each message is matched after its case and spaces are normalised. Extra words are not accepted.
+
+| Command | Effect |
+|---|---|
+| `STATUS` | a progress report now |
+| `MAN` | the command list |
+| `STOP` or `PAUSE` | no new task starts until RESUME; the driver stays up |
+| `RESUME` or `RESTART` | carry on |
+| `WIND DOWN` | the driver ends after the current step |
+| `SHUTDOWN NOW` | kills the running session at once, undoes the unfinished task, and ends the driver |
+
+The commands are read every `poll_seconds`, including during a Haiku session, where a thread reads them. A message that is
+not a command is ignored. A short one is also logged in `driver.log`, in case it was a typo.
+
+**Files** in `logs_dir`: `driver.log` (what the driver did, in order), `driver.json` (paused, busy, the current task, and a
+heartbeat), `driver.pid`, `<id>.haiku.jsonl` and `<id>.haiku.md` (Haiku's stream and its final message), `<id>.feedback.txt`
+(the test output for a retry), `usage.jsonl` (one line per session), and `revert-<time>/` (what was undone, with a backup).
+
+**One driver per folder.** A second start refuses while the first one is still running, according to `driver.pid`.
+
+**Limits.** There is no dollar cap: the Haiku limits are turns and time. The driver does not handle `ANSWER`, `APPROVED`
+or `REJECTED`, or the orchestrator's `[?]` tasks. Haiku alone has no review, so the checks above are its only gate.
+
 ## The loop template (`loop-template/LOOP.md`)
 
 The template is the prompt for an orchestrating Claude loop that works through a task queue. The loop plans and verifies;
 the worker writes the code. The template uses only the config's names, so it works with any `worker.json`.
+
+`driver.py` runs the same steps in code. You need an orchestrating session only for the `ANSWER`, `APPROVED`, `REJECTED`
+and `[?]` parts of the template. The template's driver section says which steps the driver follows.
 
 Its steps, per iteration:
 0. Read the configured phone inbox and act on the commands: fixed commands `STATUS`, `MAN`, `STOP`, `PAUSE` and
@@ -204,6 +289,8 @@ the `<runner>` placeholder is the folder that holds `worker_task.py`.
 - **ntfy.sh is a third party.** Alert text, up to 500 characters, passes through it. Keep secrets out of alerts. The hook
   sends the last assistant message, so loops should not print secrets. Self-host ntfy with access control if alerts may
   carry sensitive detail.
+- **Haiku alone can run shell commands too.** `driver.py` gives Haiku the same tools, with Bash. Its `deny_tools` list is
+  the guard against git commands that change files or the index, because the driver does the commits.
 - **The worker can run shell commands.** With the default `allowed_tools`, the worker can run any Bash command in the
   session. The limits are the scope check, the tool list and the test rules, not a command list. Narrow `allowed_tools`
   in the config if you want a tighter gate; a blocked command then shows up as an approval alert.
@@ -221,6 +308,10 @@ the `<runner>` placeholder is the folder that holds `worker_task.py`.
 | "approval" alert | A tool call was blocked, usually a command outside `allowed_tools` | Widen `allowed_tools`, or change the prompt to use an allowed command. |
 | Run stops with `looped` | The helper's advice did not help twice | Read `<id>.helper-<n>.md`, improve the task text, and retry with feedback. |
 | Inbox message never handled | The loop is not running, or the message is not one of the commands | Check the progress file for the "ignored inbox message" note. |
+| "a driver is already running" | A driver from this folder is alive, or `driver.pid` is stale | Send `SHUTDOWN NOW`, or `python driver.py --shutdown`. If the pid in `driver.pid` is not a driver, delete the file. |
+| "Driver paused: ... changes are left over" | Uncommitted changes outside the scope, which the driver never undoes | Commit or revert them, then send RESUME. |
+| "Sync failed" | The push was rejected (for example, the remote moved on) or timed out | Fix the remote and push by hand. The commit is already local, and the driver never forces a push. |
+| Phone gets no alert from the worker | The title is not in `phone_titles` | Add it to `phone_titles`, or set `notify_all`. The alert is still in `<id>.notify.log`. |
 
 Two bugs found while building this, so they are not reintroduced:
 - In PowerShell double quotes, `"`r?`n"` does not mean CRLF, because backticks are escapes there. Use single quotes with a
@@ -240,3 +331,7 @@ Two bugs found while building this, so they are not reintroduced:
 - [ ] `worker_task.py --status` runs with a valid config and prints JSON or "no hand-off has run yet".
 - [ ] A first attempt refuses to start while a leftover change exists in the scope paths.
 - [ ] A run with a fake worker sends the start and finish messages and writes the readable log.
+- [ ] `driver.py` with a task that changes a file outside the scope commits nothing, reverts the change, and marks the task `[!]`.
+- [ ] `driver.py` answers `STATUS` and `MAN` with a phone message, and a long message that is not a command is ignored.
+- [ ] `driver.py` with `SHUTDOWN NOW` during a Haiku session kills the session, leaves the task open, and exits.
+- [ ] A worker alert whose title is not in `phone_titles` does not reach the phone.
