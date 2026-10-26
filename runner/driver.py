@@ -70,6 +70,37 @@ The task:
 """
 
 
+USAGE_RESUME_MARGIN = 240  # why: restart 4 minutes after usage reopens, so the first call is not refused again
+USAGE_LIMIT = re.compile(r"session limit|usage limit", re.I)
+DONE_WHEN_ITEM = re.compile(r"\b(test|file|output) `([^`]+)`")
+OPUS_MODEL = os.environ.get("OPUS_MODEL", "opus")
+OPUS_EFFORT = "high"
+OPUS_TASK_TURNS = 200
+OPUS_TASK_TIMEOUT = 7200
+OPUS_TASK_BUDGET_USD = 25.0
+CO_AUTHOR_OPUS = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+OPUS_TASK_PROMPT = """You are the senior engineer reviewing this project, and you have one task from the build loop's queue.
+Nobody is watching: do not ask questions.
+
+Rules:
+- Read the task below and do what it says. Read files with Read, Grep and Glob. Use the shell to read git history
+  (git log, git show, git diff) and to run the tests.
+- Change only the files the task names. Never delete, skip or loosen a test. If you change code, run the tests
+  ({test_command}) until they pass: the driver runs them too and undoes everything on a fail.
+  Never change this task's own heading.
+- Never run a git command that changes anything (add, commit, reset, checkout, stash). The driver commits your work.
+- When you add tasks to the task file, use its format. Give every task a **Done when.** line whose items are `test`,
+  `file` or `output` names in backticks.
+- Your last message: the files you wrote and how many tasks you added, in one short paragraph.
+
+The project rules:
+{rules}
+
+The task:
+{task}
+"""
+
+
 def parse_settings(values):
     """The driver settings as the types they are used as. Raises ValueError for a value that is not a number."""
     return {"poll_seconds": max(5, int(values["poll_seconds"])), "max_attempts": int(values["max_attempts"]),
@@ -442,12 +473,12 @@ def finish_with_commit(task_id, title, totals, body, trailer=""):
     post("Committed", f"{task_id} {title}: {totals}")
 
 
-def haiku_stream(prompt, task_id):
-    """Runs one Haiku session with tools. Each step is logged as it happens, and the raw stream is kept in
-    <task>.haiku.jsonl. Returns (text, error); one of them is empty."""
-    command = [C.claude_exe, "-p", "--model", C.helper_model, "--tools", HAIKU_TOOLS,
+def haiku_stream(prompt, task_id, model=None, turns=None, timeout=None, extra=(), who="haiku"):
+    """Runs one session with tools: Haiku by default, or the model given (Opus tasks). Each step is logged as it happens,
+    and the raw stream is kept in <task>.<who>.jsonl. Returns (text, error); one of them is empty."""
+    command = [C.claude_exe, "-p", "--model", model or C.helper_model, "--tools", HAIKU_TOOLS,
                "--allowedTools", *HAIKU_TOOLS.split(","), "--disable-slash-commands", "--strict-mcp-config",
-               "--output-format", "stream-json", "--verbose", "--max-turns", str(C.haiku_turns)]
+               "--output-format", "stream-json", "--verbose", "--max-turns", str(turns or C.haiku_turns), *extra]
     if C.deny_tools:
         command += ["--disallowedTools", *C.deny_tools]
     extra = {} if os.name == "nt" else {"start_new_session": True}   # its own process group, so the kill reaches it all
@@ -457,14 +488,14 @@ def haiku_stream(prompt, task_id):
     CHILD["pid"] = process.pid
     stop_polling = threading.Event()
     threading.Thread(target=poll_while, args=(stop_polling,), daemon=True).start()
-    timer = threading.Timer(C.haiku_timeout, W.kill_tree, args=(process.pid,))
+    timer = threading.Timer(timeout or C.haiku_timeout, W.kill_tree, args=(process.pid,))
     timer.start()
     process.stdin.write(prompt)
     process.stdin.close()
     started = time.time()
     steps = 0
     result = {}
-    with open(C.logs / f"{task_id}.haiku.jsonl", "w", encoding="utf-8", newline="\n") as raw:
+    with open(C.logs / f"{task_id}.{who}.jsonl", "w", encoding="utf-8", newline="\n") as raw:
         for line in process.stdout:
             raw.write(line)
             try:
@@ -493,7 +524,8 @@ def haiku_stream(prompt, task_id):
     timer.cancel()
     seconds = round(time.time() - started)
     if result:
-        W.log_usage({"who": "haiku", "kind": "haiku-alone", "is_error": bool(result.get("is_error")),
+        W.log_usage({"who": who, "kind": "haiku-alone" if who == "haiku" else "opus-task",
+                     "is_error": bool(result.get("is_error")),
                      "turns": result.get("num_turns"), "seconds": seconds,
                      "cost_usd": result.get("total_cost_usd"), "usage": result.get("usage")})
         log(f"haiku finished in {seconds} s: {result.get('num_turns')} turns, cost {result.get('total_cost_usd')} USD, "
@@ -502,6 +534,46 @@ def haiku_stream(prompt, task_id):
         return "", (f"Haiku's session ended with exit {code} after {seconds} s: "
                     f"{str(result.get('result', 'no result'))[:300]}")
     return str(result["result"]).strip(), ""
+
+
+def reset_time(error):
+    """The epoch time the usage limit resets, read from a message such as 'resets 1:20pm (America/Los_Angeles)', or None.
+    A time already past today means tomorrow. Without the zone's data, the machine's local time is used."""
+    match = re.search(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)(?:\s*\(([^)]+)\))?", error, re.I)
+    if not match:
+        return None
+    hour = int(match.group(1)) % 12 + (12 if match.group(3).lower() == "pm" else 0)
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(match.group(4)) if match.group(4) else None
+    except Exception:
+        zone = None
+    now_at = datetime.datetime.now(zone)
+    reset = now_at.replace(hour=hour, minute=int(match.group(2) or 0), second=0, microsecond=0)
+    if reset <= now_at:
+        reset += datetime.timedelta(days=1)
+    return reset.timestamp()
+
+
+def hit_usage_limit(task_id, error, state):
+    """True when a session failed because usage is exhausted. The driver pauses with the task kept open, sends an urgent
+    phone alert with the restart time, and restarts itself USAGE_RESUME_MARGIN seconds after the limit resets."""
+    if not USAGE_LIMIT.search(error):
+        return False
+    resume = reset_time(error)
+    state.update({"paused": True, "resume_at": resume + USAGE_RESUME_MARGIN if resume else None})
+    write_state(state)
+    if state["resume_at"]:
+        when = time.strftime("%a %H:%M", time.localtime(state["resume_at"]))
+        text = (f"Session usage is exhausted, so the loop stopped during {task_id}. It restarts at {when} (machine time), "
+                f"4 minutes after usage reopens. Send RESUME to restart it sooner. {error[:200]}")
+    else:
+        when = "unknown"
+        text = (f"Session usage is exhausted, so the loop stopped during {task_id}. No restart time could be read from "
+                f"the message, so it waits for RESUME. {error[:200]}")
+    log(f"usage limit reached during {task_id}: restart at {when}, the task stays open")
+    post("Loop stopped: session usage exhausted", text, "urgent")
+    return True
 
 
 def haiku_alone(task_id, title, spec):
@@ -518,6 +590,8 @@ def haiku_alone(task_id, title, spec):
         return
     (C.logs / f"{task_id}.haiku.md").write_text((text or error) + "\n", encoding="utf-8", newline="\n")
     if error:
+        if hit_usage_limit(task_id, error, RUNTIME["state"]):
+            return
         block(task_id, f"Haiku could not do it: {error}", "haiku_failed")
         return
     reason, totals = check_passed({})
@@ -583,15 +657,93 @@ def worker_task(task_id, title, state):
         return
 
 
+def is_opus_task(spec):
+    """A task whose Who line says Opus is a review or planning task: Opus does it once, at high effort."""
+    return bool(re.search(r"^\*\*Who\.\*\* Opus\b", spec, re.M))
+
+
+def done_when(spec):
+    """The task's Done when checks as (kind, value) pairs: test `name`, file `path` or output `text`. The line may wrap."""
+    lines = spec.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("**Done when.**"):
+            paragraph = []
+            for part in lines[index:]:
+                if not part.strip():
+                    break
+                paragraph.append(part)
+            return DONE_WHEN_ITEM.findall(" ".join(paragraph))
+    return []
+
+
+def check_done_when(spec):
+    """The first Done when check that does not hold, or ''. A task without the line is refused."""
+    checks = done_when(spec)
+    if not checks:
+        return "the task has no **Done when.** line, so the driver cannot tell that it was done"
+    output = W.test_output()
+    for kind, value in checks:
+        if kind == "file":
+            if not (C.project / value).exists() or not git("status", "--porcelain", "--", value).stdout.strip():
+                return f"Done when: {value} was not written"
+        elif kind == "test":
+            tests = [path for folder in C.scope for path in (C.project / folder).rglob("*.gd")]
+            if not any(f"func {value}(" in path.read_text(encoding="utf-8", errors="replace") for path in tests):
+                return f"Done when: no test function {value} in the scope"
+        elif value not in output:
+            return f"Done when: the test run did not print {value!r}"
+    return ""
+
+
+def do_opus_task(task_id, title, spec, state):
+    """Runs a task marked Opus in one session. Changes outside the scope and the loop folder are refused. If code in the
+    scope changed, the tests must pass. The task's Done when checks must hold, and then every change is committed."""
+    W.CURRENT_TASK["id"] = task_id
+    rules_path = C.project / C.rules_file
+    rules = rules_path.read_text(encoding="utf-8") if rules_path.exists() else "(no rules file)"
+    prompt = OPUS_TASK_PROMPT.format(rules=rules, test_command=C.test_command_text, task=spec)
+    log(f"opus task starts: {task_id}: {title}")
+    text, error = haiku_stream(prompt, task_id, model=OPUS_MODEL, turns=OPUS_TASK_TURNS, timeout=OPUS_TASK_TIMEOUT,
+                               extra=("--effort", OPUS_EFFORT, "--max-budget-usd", str(OPUS_TASK_BUDGET_USD)),
+                               who="opus")
+    if RUNTIME.get("stopping"):
+        return
+    (C.logs / f"{task_id}.opus.md").write_text((text or error) + "\n", encoding="utf-8", newline="\n")
+    if error and hit_usage_limit(task_id, error, state):
+        revert_unfinished()
+        return
+    reason, totals = "", "-"
+    if error:
+        reason = f"Opus could not do it: {error}"
+    elif outside_scope():
+        reason = f"changed outside the scope: {', '.join(outside_scope()[:3])}"
+    elif leftover_changes():
+        reason, totals = check_passed({})
+        totals = totals or "-"
+    if not reason:
+        reason = check_done_when(spec)
+    if reason:
+        block(task_id, reason, "opus_failed")
+        return
+    set_heading(task_id, "x")
+    add_progress(row=f"| {datetime.date.today().isoformat()} | {task_id} | done | {totals} | {title} · Opus |")
+    paths = sorted(set(W.changed_paths()) | {C.tasks_file, C.progress_file})
+    commit(f"{task_id}: {title}\n\n{(text or '')[:1500]}\n\n{CO_AUTHOR_OPUS}\n", paths)
+    post("Committed", f"{task_id} {title} (Opus)")
+
+
 def do_task(task_id, title, state, solo):
+    spec = W.find_spec(task_id)
     if not clear_leftovers(task_id):
         state["paused"] = True
         write_state(state)
         post("Driver paused", f"Could not start {task_id}: changes are left over from an earlier run. Look at the "
              "driver log, then send RESUME.", "high")
         return
-    if solo:
-        haiku_alone(task_id, title, W.find_spec(task_id))
+    if is_opus_task(spec):
+        do_opus_task(task_id, title, spec, state)
+    elif solo:
+        haiku_alone(task_id, title, spec)
     else:
         worker_task(task_id, title, state)
 
@@ -604,7 +756,7 @@ def main(solo=True):
         sys.exit(f"a driver is already running (pid {other}). Stop it with: python driver.py --shutdown, or send "
                  f"SHUTDOWN NOW. If pid {other} is not a driver, delete {PATHS['pid']}")
     state = read_state()
-    state.update({"paused": False, "wind_down": False, "busy": False, "solo": solo,
+    state.update({"paused": False, "resume_at": None, "wind_down": False, "busy": False, "solo": solo,
                   "mode": "Haiku alone" if solo else "worker with Haiku review"})
     RUNTIME["state"] = state
     PATHS["pid"].write_text(str(os.getpid()), encoding="utf-8", newline="\n")
@@ -621,6 +773,11 @@ def main(solo=True):
             post("Loop exited", "The driver has ended. Start it again to continue.")
             log("driver ends on request")
             return
+        if state.get("paused") and state.get("resume_at") and time.time() >= state["resume_at"]:
+            state.update({"paused": False, "resume_at": None})
+            write_state(state)
+            log("usage limit has reset: resuming")
+            post("Loop resumed", "The usage limit has reset, so the driver carries on.")
         if state.get("paused"):
             if not was_paused:
                 log("paused: no new task starts until RESUME")
