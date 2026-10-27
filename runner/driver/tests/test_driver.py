@@ -1,63 +1,56 @@
-"""Tests for the loop driver. Run from the runner folder: python -m unittest discover -s driver/tests -v
+"""Tests for the build loop's driver. Run from the project root: python -m unittest discover -s loop/driver/tests -v
 
-Each test gets a throwaway project with its own worker.json. Nothing here starts a session or calls ntfy: the parts
-that would are replaced."""
+Nothing here starts a session, calls ntfy or runs git commands that change files: the parts that would are replaced."""
 import datetime
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
 
-HERE = pathlib.Path(__file__).resolve().parent
-sys.path[:0] = [str(HERE.parent), str(HERE.parent.parent)]
+os.environ.setdefault("WORKER_CONFIG", str(pathlib.Path(__file__).resolve().parent / "fixtures" / "worker.json"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import budget as B  # noqa: E402
 import commands as K  # noqa: E402
+import loop_common as C  # noqa: E402
 import mainloop as M  # noqa: E402
+import opus as O  # noqa: E402
 import phone as P  # noqa: E402
 import runners as RN  # noqa: E402
 import runtime as R  # noqa: E402
+import scheduler as SC  # noqa: E402
 import sessions as X  # noqa: E402
 import settings as S  # noqa: E402
+import slots as SL  # noqa: E402
 import tasks as T  # noqa: E402
-import workspace as WS  # noqa: E402
-import worker_task as W  # noqa: E402
+import workspace as W  # noqa: E402
 
-FIXTURES = HERE / "fixtures"
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 
 
-def git(root, *args):
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=root, check=True,
-                   capture_output=True)
+def fake_slot(name="1", root=None, base="base0"):
+    """A slot that is never made on disk: its root is a folder the test chooses."""
+    slot = SL.Slot(name)
+    slot.root = pathlib.Path(root) if root else slot.root
+    slot.base = base
+    return slot
 
 
 class DriverTest(unittest.TestCase):
-    """A throwaway git project with a config, a task file and a loop file; the phone and print are replaced."""
+    """Every test gets a temp folder for the driver's files, and the phone and the log are replaced."""
 
     def setUp(self):
-        self.root = pathlib.Path(tempfile.mkdtemp())
-        (self.root / "src").mkdir()
-        (self.root / "loop").mkdir()
-        (self.root / "loop" / "TASKS.md").write_text("### [ ] T-1 First\n**Done when.** test `test_one`\n",
-                                                    encoding="utf-8")
-        (self.root / "loop" / "LOOP.md").write_text("```driver-settings\npoll_seconds: 60\n```\n", encoding="utf-8")
-        (self.root / ".gitignore").write_text("loop/logs/\n", encoding="utf-8")
-        (self.root / "worker.json").write_text(json.dumps({
-            "project_root": ".", "scope": ["src/"], "worker_model": "unused",
-            "test_command": [sys.executable, "-c", "print('1 passed, 0 failed')"],
-            "topic_file": "no-topic.txt", "token_file": "no-token.txt", "haiku_turns": 12,
-        }), encoding="utf-8")
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
-        git(self.root, "add", "-A")
-        git(self.root, "commit", "-q", "-m", "start")
-        self.message_count = 0
+        self.temp = pathlib.Path(tempfile.mkdtemp())
         self.posts = []
         patches = [
-            mock.patch.dict(os.environ, {"WORKER_CONFIG": str(self.root / "worker.json")}),
+            mock.patch.object(C, "LOGS", self.temp),
+            mock.patch.object(R, "DRIVER_STATE", self.temp / "driver.json"),
+            mock.patch.object(R, "DRIVER_LOG", self.temp / "driver.log"),
+            mock.patch.object(R, "REQUEST_FILE", self.temp / "driver-request.txt"),
+            mock.patch.object(P, "SEEN", self.temp / "seen.txt"),
             mock.patch.object(P, "post", lambda title, body, priority="default", actions="":
                               self.posts.append((title, body, actions))),
             mock.patch("builtins.print"),
@@ -65,37 +58,20 @@ class DriverTest(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        W.configure()
-        R.init_paths()
         R.RUNTIME.clear()
-        R.RUNTIME.update(state={}, settings=S.parse_settings(S.SETTING_DEFAULTS), last=None)
+        R.RUNTIME.update(state={})
+        R.ctx().clear()
 
-    def phone(self, *texts, ids=None):
-        if ids is None:
-            ids = [f"id{self.message_count + index}" for index in range(len(texts))]
-            self.message_count += len(texts)
-        with mock.patch.object(W, "poll_inbox", return_value=list(zip(ids, texts))):
+    def phone(self, *texts):
+        """handle_commands with these phone messages and no PC requests."""
+        messages = [(f"id{index}", text) for index, text in enumerate(texts)]
+        with mock.patch.object(K, "poll_messages", return_value=messages):
             K.handle_commands(R.RUNTIME["state"])
 
-    def machine(self, *texts):
-        R.PATHS["request"].write_text("\n".join(texts) + "\n", encoding="utf-8")
-        with mock.patch.object(W, "poll_inbox", return_value=[]):
+    def pc(self, *texts):
+        R.REQUEST_FILE.write_text("\n".join(texts) + "\n", encoding="utf-8")
+        with mock.patch.object(K, "poll_messages", return_value=[]):
             K.handle_commands(R.RUNTIME["state"])
-
-
-class ConfigTest(DriverTest):
-    def test_old_key_names_are_still_read(self):
-        self.assertEqual(W.C.task_turns, 12)
-        self.assertEqual(W.C.task_model, "sonnet")
-
-    def test_token_is_sent_when_present(self):
-        self.assertEqual(W.ntfy_headers({"Title": "x"}), {"Title": "x"})
-        W.C.token = "tk_abc"
-        self.assertEqual(W.ntfy_headers()["Authorization"], "Bearer tk_abc")
-
-    def test_read_only_git_is_not_denied(self):
-        self.assertNotIn("Bash(git stash:*)", W.C.deny_tools)
-        self.assertIn("Bash(git stash pop:*)", W.C.deny_tools)
 
 
 class StreamParserTest(DriverTest):
@@ -103,30 +79,39 @@ class StreamParserTest(DriverTest):
         parts = []
         for line in (FIXTURES / "stream.jsonl").read_text(encoding="utf-8").splitlines():
             parts += X.event_parts(json.loads(line))
-        self.assertEqual([kind for kind, _ in parts], ["say", "step", "system", "tool_result", "result"])
+        kinds = [kind for kind, _ in parts]
+        self.assertEqual(kinds, ["say", "step", "system", "tool_result", "result"])
 
     def test_permission_denied_is_reported_as_a_system_part(self):
-        event = {"type": "system", "subtype": "permission_denied", "message": "denied."}
-        self.assertEqual(X.event_parts(event), [("system", "permission_denied: denied.")])
+        event = {"type": "system", "subtype": "permission_denied", "message": "Permission to use Bash has been denied."}
+        self.assertEqual(X.event_parts(event), [("system", "permission_denied: Permission to use Bash has been denied.")])
+
+    def test_tool_result_is_one_line(self):
+        event = {"type": "user", "message": {"content": [{"type": "tool_result", "content": "a\nb"}]}}
+        self.assertEqual(X.event_parts(event), [("tool_result", "a | b")])
 
 
-class TaskModelTest(DriverTest):
-    def test_default_comes_from_the_config(self):
-        self.assertEqual(K.task_model({}), ("sonnet", None))
+class WorkerSettingTest(DriverTest):
+    def test_default_is_sonnet(self):
+        self.assertEqual(K.worker({}), ("sonnet", None))
 
     def test_model_and_effort(self):
         state = {}
-        K.set_model(state, ["MODEL", "HAIKU", "HIGH"])
-        self.assertEqual(K.task_model(state), ("haiku", "high"))
-        K.set_model(state, ["EFFORT", "MAX"])
-        self.assertEqual(K.task_model(state), ("haiku", "max"))
-        K.set_model(state, ["MODEL", "OPUS", "DEFAULT"])
-        self.assertEqual(K.task_model(state), ("opus", None))
+        K.set_worker(state, ["MODEL", "HAIKU", "HIGH"])
+        self.assertEqual(K.worker(state), ("haiku", "high"))
+        K.set_worker(state, ["EFFORT", "MAX"])
+        self.assertEqual(K.worker(state), ("haiku", "max"))
+        K.set_worker(state, ["MODEL", "OPUS", "DEFAULT"])
+        self.assertEqual(K.worker(state), ("opus", None))
 
     def test_unknown_model_changes_nothing(self):
-        state = {"task_model": "haiku"}
-        self.assertIn("Not changed", K.set_model(state, ["MODEL", "GPT"]))
-        self.assertEqual(K.task_model(state), ("haiku", None))
+        state = {"worker_model": "haiku"}
+        reply = K.set_worker(state, ["MODEL", "GPT"])
+        self.assertIn("Not changed", reply)
+        self.assertEqual(K.worker(state), ("haiku", None))
+
+    def test_effort_alone_asks_for_a_level(self):
+        self.assertIn("Say EFFORT", K.set_worker({}, ["EFFORT"]))
 
 
 class ApprovalTest(DriverTest):
@@ -136,36 +121,37 @@ class ApprovalTest(DriverTest):
         self.assertTrue(K.needs_approval("opus", None))
         self.assertFalse(K.needs_approval("opus", "low"))
         self.assertFalse(K.needs_approval("sonnet", "max"))
+        self.assertFalse(K.needs_approval("haiku", None))
 
-    def answer_with(self, answer):
+    def test_approve_button_approves(self):
         state = R.RUNTIME["state"]
 
         def tap(_state):
             for code in state["approvals"]:
-                state["approvals"][code]["answer"] = answer
+                state["approvals"][code]["answer"] = "approve"
         with mock.patch.object(K, "handle_commands", tap):
-            return K.approved(state, "M2-R review")
-
-    def test_approve_and_deny_buttons(self):
-        self.assertTrue(self.answer_with("approve"))
+            self.assertTrue(K.approved(state, "M2-R review"))
+        self.assertEqual(state["approvals"], {})
         self.assertIn("APPROVE ", self.posts[0][2])
         self.assertIn("DENY ", self.posts[0][2])
-        self.assertFalse(self.answer_with("deny"))
-        self.assertEqual(R.RUNTIME["state"]["approvals"], {})
 
-    def test_no_answer_is_a_denial(self):
-        settings = dict(R.RUNTIME["settings"], approval_hours=0)
-        with mock.patch.dict(R.RUNTIME, settings=settings), mock.patch.object(K, "handle_commands"):
-            self.assertFalse(K.approved(R.RUNTIME["state"], "x"))
+    def test_deny_and_no_answer_are_denials(self):
+        state = R.RUNTIME["state"]
+
+        def tap(_state):
+            for code in state["approvals"]:
+                state["approvals"][code]["answer"] = "deny"
+        with mock.patch.object(K, "handle_commands", tap):
+            self.assertFalse(K.approved(state, "a"))
+        with mock.patch.object(S, "APPROVAL_HOURS", 0), mock.patch.object(K, "handle_commands", lambda s: None):
+            self.assertFalse(K.approved(state, "b"))
 
     def test_approvals_off_asks_nothing(self):
-        settings = dict(R.RUNTIME["settings"], approvals=False)
-        with mock.patch.dict(R.RUNTIME, settings=settings):
-            self.assertTrue(K.approved(R.RUNTIME["state"], "an Opus task"))
+        state = R.RUNTIME["state"]
+        with mock.patch.object(S, "APPROVALS_ON", False):
+            self.assertTrue(K.approved(state, "M3-F4 Opus"))
         self.assertEqual(self.posts, [])
-        self.assertEqual(S.parse_settings(dict(S.SETTING_DEFAULTS, approvals="off"))["approvals"], False)
-        with self.assertRaises(ValueError):
-            S.parse_settings(dict(S.SETTING_DEFAULTS, approvals="maybe"))
+        self.assertEqual(state.get("approvals", {}), {})
 
     def test_phone_answer_needs_the_right_code(self):
         state = R.RUNTIME["state"]
@@ -175,20 +161,29 @@ class ApprovalTest(DriverTest):
         self.phone("deny abc123")
         self.assertEqual(state["approvals"]["abc123"]["answer"], "deny")
 
-    def test_machine_approve_answers_every_request(self):
+    def test_pc_approve_answers_every_request(self):
         state = R.RUNTIME["state"]
         state["approvals"] = {"a": {"what": "x", "answer": None}, "b": {"what": "y", "answer": None}}
-        self.machine("APPROVE")
+        self.pc("APPROVE")
         self.assertEqual([r["answer"] for r in state["approvals"].values()], ["approve", "approve"])
 
 
 class CommandTest(DriverTest):
-    def test_model_from_the_phone_and_the_machine(self):
+    def test_opus_question_runs_from_the_phone(self):
+        with mock.patch.object(O, "ask_opus") as ask:
+            self.phone("OPUS: Why is M2-30 blocked?")
+        ask.assert_called_once_with("Why is M2-30 blocked?")
+
+    def test_model_report_and_change_from_the_phone(self):
+        self.phone("MODEL")
+        self.assertEqual(self.posts[-1][0], "Loop worker")
         self.phone("model haiku low")
-        self.assertEqual(K.task_model(R.RUNTIME["state"]), ("haiku", "low"))
-        self.machine("MODEL opus high")
-        self.assertEqual(K.task_model(R.RUNTIME["state"]), ("opus", "high"))
-        self.assertFalse(R.PATHS["request"].exists())
+        self.assertEqual(K.worker(R.RUNTIME["state"]), ("haiku", "low"))
+
+    def test_pc_commands_are_read_from_the_request_file(self):
+        self.pc("MODEL opus high")
+        self.assertEqual(K.worker(R.RUNTIME["state"]), ("opus", "high"))
+        self.assertFalse(R.REQUEST_FILE.exists())
 
     def test_pause_and_resume(self):
         self.phone("pause")
@@ -196,24 +191,25 @@ class CommandTest(DriverTest):
         self.phone("RESUME")
         self.assertFalse(R.RUNTIME["state"]["paused"])
 
-    def test_a_message_is_read_once(self):
-        self.phone("pause", ids=["same"])
-        R.RUNTIME["state"]["paused"] = False
-        self.phone("pause", ids=["same"])
-        self.assertFalse(R.RUNTIME["state"]["paused"])
-
 
 class EscalationTest(DriverTest):
-    def run_task(self, results, approve=True, model="sonnet"):
+    def run_task(self, results, approve=True, escalate="opus", model="sonnet"):
         calls = []
 
-        def attempt(task_id, title, spec, who, level, feedback):
+        def attempt(slot, task_id, title, spec, who, level, feedback):
             calls.append((who, feedback))
             return results[len(calls) - 1]
-        with mock.patch.object(RN, "model_attempt", attempt), mock.patch.object(K, "approved", return_value=approve), \
-                mock.patch.object(T, "revert_unfinished"), mock.patch.object(T, "block") as block:
-            RN.model_task("T-1", "First", "spec", {"task_model": model})
+        with mock.patch.object(S, "ESCALATE_MODEL", escalate), mock.patch.object(RN, "worker_attempt", attempt), \
+                mock.patch.object(K, "approved", return_value=approve), mock.patch.object(SL, "prepare"), \
+                mock.patch.object(T, "requeue") as requeue, mock.patch.object(T, "block") as block:
+            RN.do_worker_task(fake_slot(), "M2-30", "Layer toggles", "spec", {"worker_model": model})
+        self.requeue = requeue
         return calls, block
+
+    def test_success_needs_no_retry(self):
+        calls, block = self.run_task([None])
+        self.assertEqual([who for who, _ in calls], ["sonnet"])
+        block.assert_not_called()
 
     def test_failure_is_retried_by_the_stronger_model_with_feedback(self):
         calls, block = self.run_task(["tests fail", None])
@@ -222,22 +218,24 @@ class EscalationTest(DriverTest):
 
     def test_two_failures_block(self):
         calls, block = self.run_task(["tests fail", "still failing"])
-        self.assertEqual(block.call_args[0][1], "still failing")
+        self.assertEqual(block.call_args[0][3], "still failing")
 
     def test_denied_retry_blocks_with_the_first_reason(self):
         calls, block = self.run_task(["tests fail"], approve=False)
         self.assertEqual(len(calls), 1)
-        self.assertIn("not approved", block.call_args[0][1])
+        self.assertIn("tests fail", block.call_args[0][3])
+        self.assertIn("not approved", block.call_args[0][3])
 
-    def test_no_retry_by_an_equal_model(self):
+    def test_no_retry_by_a_weaker_or_equal_model(self):
         calls, block = self.run_task(["tests fail"], model="opus")
         self.assertEqual(len(calls), 1)
+        block.assert_called_once()
 
     def test_denied_first_attempt_pauses_and_leaves_the_task_open(self):
-        state = {"task_model": "fable"}
-        with mock.patch.object(K, "approved", return_value=False), mock.patch.object(RN, "model_attempt") as attempt, \
+        state = {"worker_model": "fable"}
+        with mock.patch.object(K, "approved", return_value=False), mock.patch.object(RN, "worker_attempt") as attempt, \
                 mock.patch.object(T, "block") as block:
-            RN.model_task("T-1", "x", "spec", state)
+            RN.do_worker_task(fake_slot(), "M2-30", "x", "spec", state)
         attempt.assert_not_called()
         block.assert_not_called()
         self.assertTrue(state["paused"])
@@ -247,216 +245,267 @@ class CrashTest(DriverTest):
     def test_a_task_error_blocks_the_task(self):
         state = {}
         with mock.patch.object(T, "block") as block:
-            RN.task_crashed("T-1", ValueError("boom"), 1, state)
-        self.assertIn("boom", block.call_args[0][1])
+            RN.task_crashed(fake_slot(), "M2-30", "x", ValueError("boom"), 1, state)
+        self.assertIn("boom", block.call_args[0][3])
         self.assertFalse(state.get("paused"))
 
     def test_a_failed_block_pauses(self):
         state = {}
         with mock.patch.object(T, "block", side_effect=RuntimeError("git broke")):
-            RN.task_crashed("T-1", ValueError("boom"), 1, state)
+            RN.task_crashed(fake_slot(), "M2-30", "x", ValueError("boom"), 1, state)
         self.assertTrue(state["paused"])
 
     def test_errors_in_a_row_pause(self):
         state = {}
         with mock.patch.object(T, "block"):
-            RN.task_crashed("T-1", ValueError("boom"), S.MAX_TASK_ERRORS, state)
+            RN.task_crashed(fake_slot(), "M2-30", "x", ValueError("boom"), S.MAX_TASK_ERRORS, state)
         self.assertTrue(state["paused"])
-
-
-class ChecksTest(DriverTest):
-    def test_done_when_test_is_found_in_any_language(self):
-        (self.root / "src" / "test_app.py").write_text("def test_one():\n    pass\n", encoding="utf-8")
-        self.assertEqual(WS.check_done_when("**Done when.** test `test_one`", ""), "")
-        self.assertIn("no test function", WS.check_done_when("**Done when.** test `test_two`", ""))
-
-    def test_missing_done_when_is_refused_only_when_required(self):
-        self.assertIn("no **Done when.**", WS.check_done_when("no line", ""))
-        self.assertEqual(WS.check_done_when("no line", "", required=False), "")
-
-    def test_removed_tests_are_caught_by_count(self):
-        W.C.test_count_glob, W.C.test_count_marker = "src/**/test_*.py", "def test_"
-        (self.root / "src" / "test_app.py").write_text("def test_one():\n    pass\n", encoding="utf-8")
-        R.RUNTIME["tests_before"] = 2
-        reason, _ = RN.check_passed({}, "")
-        self.assertIn("tests were removed", reason)
-
-    def test_files_outside_the_scope_are_undone_with_their_folders(self):
-        stray = self.root / "src2" / "deep" / "file.py"
-        stray.parent.mkdir(parents=True)
-        stray.write_text("x", encoding="utf-8")
-        self.assertEqual(WS.outside_scope(None), ["src2/deep/file.py"])
-        WS.undo_changes(WS.outside_scope(None))
-        self.assertFalse((self.root / "src2").exists())
-
-
-class SnapshotTest(DriverTest):
-    BEFORE = ("def test_a():\n    assert x == 1\n    self.assertTrue(y)\n\n\n"
-              "def test_b():\n    assert z\n\n\ndef helper():\n    assert q\n")
-
-    def commit_test_file(self, text):
-        (self.root / "src" / "test_app.py").write_text(text, encoding="utf-8")
-        git(self.root, "add", "-A")
-        git(self.root, "commit", "-q", "-m", "tests")
-
-    def test_assert_counts_per_test_function(self):
-        self.assertEqual(WS.assert_counts(self.BEFORE), {"test_a": 2, "test_b": 1})
-
-    def test_a_loosened_test_the_task_does_not_name_fails_the_gate(self):
-        self.commit_test_file(self.BEFORE)
-        snap = WS.snapshot()
-        R.RUNTIME["snap"] = snap
-        (self.root / "src" / "test_app.py").write_text(self.BEFORE.replace("    self.assertTrue(y)\n", ""),
-                                                      encoding="utf-8")
-        self.assertEqual(WS.weakened_tests(snap, "spec"), ["test_app.test_a (2 to 1 asserts)"])
-        self.assertEqual(WS.weakened_tests(snap, "rewrite test_a"), [])
-        self.assertIn("fewer asserts", RN.check_passed({}, "spec")[0])
-
-    def test_a_removed_test_function_is_named(self):
-        self.commit_test_file(self.BEFORE)
-        snap = WS.snapshot()
-        (self.root / "src" / "test_app.py").write_text("def test_a():\n    assert x\n", encoding="utf-8")
-        self.assertEqual(WS.removed_tests(snap), ["test_b"])
-
-    def test_loop_files_the_task_does_not_name_fail_the_gate(self):
-        snap = WS.snapshot()
-        R.RUNTIME["snap"] = snap
-        (self.root / "loop" / "LOOP.md").write_text("changed\n", encoding="utf-8")
-        (self.root / "loop" / "NOTES.md").write_text("named\n", encoding="utf-8")
-        spec = "**Files.** Create `loop/NOTES.md`.\n"
-        self.assertEqual(WS.loop_changes(snap, WS.allowed_loop_files(spec, False)), ["loop/LOOP.md"])
-        self.assertIn("loop/TASKS.md", WS.allowed_loop_files(spec, True))
-        self.assertIn("the task does not name", RN.check_passed({}, spec)[0])
-
-    def test_revert_leaves_the_owners_earlier_edits(self):
-        (self.root / "loop" / "LOOP.md").write_text("owner's edit\n", encoding="utf-8")
-        R.set_snap(R.RUNTIME["state"], WS.snapshot())
-        (self.root / "src" / "new.py").write_text("task's file\n", encoding="utf-8")
-        T.revert_unfinished()
-        self.assertFalse((self.root / "src" / "new.py").exists())
-        self.assertEqual((self.root / "loop" / "LOOP.md").read_text(encoding="utf-8"), "owner's edit\n")
-
-    def test_a_commit_during_a_task_pauses_and_leaves_it_open(self):
-        R.RUNTIME["state"] = {}
-        R.RUNTIME["snap"] = WS.snapshot()
-        self.assertFalse(RN.commit_made_during("T-1"))
-        self.commit_test_file("x = 1\n")
-        self.assertTrue(RN.commit_made_during("T-1"))
-        self.assertTrue(R.RUNTIME["state"]["paused"])
-
-    def test_the_snapshot_survives_in_driver_json(self):
-        state = {}
-        R.set_snap(state, {"head": "abc", "dirty": {"b", "a"}})
-        R.RUNTIME.pop("snap")
-        self.assertEqual(R.current_snap(R.read_state()), {"head": "abc", "dirty": {"a", "b"}})
-
-
-class ReliabilityTest(DriverTest):
-    def test_a_hung_test_run_is_killed_and_has_no_totals(self):
-        W.C.test_command = [sys.executable, "-c", "import time; print('1 passed, 0 failed', flush=True); time.sleep(60)"]
-        W.C.test_timeout = 2
-        started = time.time()
-        output = X.test_output()
-        self.assertLess(time.time() - started, 30)
-        self.assertEqual(W.totals_line(output), "")
-        self.assertIn("timed out", output)
-
-    def test_claude_is_the_newest_extension_copy(self):
-        for version in ("2.1.99", "2.1.311", "2.1.310"):
-            exe = self.root / f"anthropic.claude-code-{version}-x" / "resources" / "native-binary" / "claude.exe"
-            exe.parent.mkdir(parents=True)
-            exe.write_text("")
-        W.C.claude_exe = "claude"
-        with mock.patch.object(X, "EXTENSIONS", self.root), mock.patch.object(X.shutil, "which", return_value=None):
-            self.assertIn("2.1.311", X.claude_exe())
-        W.C.claude_exe = "/opt/claude"
-        self.assertEqual(X.claude_exe(), "/opt/claude")
-
-    def test_a_session_gets_what_is_left_of_the_day(self):
-        with mock.patch.object(B, "spend_on", return_value=110.0):
-            self.assertEqual(B.session_budget(30.0), 10.0)
-            R.RUNTIME["state"] = {}
-            self.assertTrue(B.cut_by_daily_budget("error_max_budget_usd"))
-        with mock.patch.object(B, "spend_on", return_value=10.0):
-            self.assertEqual(B.session_budget(30.0), 30.0)
-            self.assertFalse(B.cut_by_daily_budget("error_max_budget_usd"))
-
-    def test_blocks_in_a_row_queue_a_triage_then_pause(self):
-        state = R.RUNTIME["state"]
-        state["block_streak"] = [{"task": "T-1", "reason": "pinned"}, {"task": "T-2", "reason": "pinned"}]
-        T.after_blocks(state)
-        self.assertIn("T-2: pinned", state["triage"])
-        self.assertFalse(state.get("paused"))
-        state["block_streak"] += [{"task": "T-3", "reason": "x"}, {"task": "T-4", "reason": "x"}]
-        T.after_blocks(state)
-        self.assertTrue(state["paused"])
-        self.assertEqual(state["block_streak"], [])
-
-    def test_a_triage_with_no_change_commits_nothing(self):
-        state = R.RUNTIME["state"]
-        state["triage"] = "- T-1: pinned"
-        with mock.patch.object(X, "run_session", return_value=("No shared cause.", "")):
-            RN.run_triage(state, state["triage"])
-        self.assertNotIn("triage", state)
-        self.assertEqual(self.posts[-1][0], "Triage: no change")
-        self.assertIsNone(state["snap"])
-
-    def test_autostart_respects_an_owner_stop(self):
-        R.write_state({"ended_by": "owner"})
-        with mock.patch.object(M, "supervise") as supervise:
-            self.assertEqual(M.autostart([]), 0)
-            supervise.assert_not_called()
-            R.write_state({"ended_by": None})
-            M.autostart([])
-            supervise.assert_called_once()
-
-    def test_runners_pick_the_kind_of_task(self):
-        def pick(spec, solo):
-            return next(run for kind, run in RN.RUNNERS if kind(spec, solo))
-        self.assertIs(pick("### [ ] T-1 x\n**Who.** Opus\n", True), RN.do_opus_task)
-        self.assertIs(pick("### [ ] T-1 x\n", True), RN.model_task)
-        self.assertIs(pick("### [ ] T-1 x\n", False), RN.worker_task)
 
 
 class FilesTest(DriverTest):
     def test_state_is_written_whole(self):
-        R.write_state({"paused": True, "task": "T-1"})
-        self.assertEqual(json.loads(R.PATHS["state"].read_text(encoding="utf-8"))["task"], "T-1")
-        self.assertFalse(R.PATHS["state"].with_suffix(".tmp").exists())
+        R.write_driver_state({"paused": True, "task": "M2-30"})
+        self.assertEqual(json.loads(R.DRIVER_STATE.read_text(encoding="utf-8"))["task"], "M2-30")
+        self.assertFalse(R.DRIVER_STATE.with_suffix(".tmp").exists())
 
     def test_log_drops_control_characters_and_starts_a_new_file_each_day(self):
-        R.PATHS["log"].write_text("old\n", encoding="utf-8")
+        R.DRIVER_LOG.write_text("old\n", encoding="utf-8")
         yesterday = time.time() - 86400
-        os.utime(R.PATHS["log"], (yesterday, yesterday))
+        os.utime(R.DRIVER_LOG, (yesterday, yesterday))
         R.log("a\x00b\x1bc")
         day = datetime.date.fromtimestamp(yesterday).isoformat()
-        self.assertEqual(R.PATHS["log"].with_name(f"driver-{day}.log").read_text(encoding="utf-8"), "old\n")
-        self.assertTrue(R.PATHS["log"].read_text(encoding="utf-8").endswith(" abc\n"))
-
-    def test_spend_on_adds_up_one_day(self):
-        (W.C.logs / W.C.usage_log).write_text(
-            json.dumps({"time": "2026-10-26 10:00:00", "cost_usd": 1.5}) + "\n"
-            + json.dumps({"time": "2026-10-26 11:00:00", "cost_usd": None}) + "\n"
-            + json.dumps({"time": "2026-10-25 11:00:00", "cost_usd": 9}) + "\nnot json\n", encoding="utf-8")
-        self.assertAlmostEqual(B.spend_on("2026-10-26"), 1.5)
+        self.assertEqual((self.temp / f"driver-{day}.log").read_text(encoding="utf-8"), "old\n")
+        self.assertTrue(R.DRIVER_LOG.read_text(encoding="utf-8").endswith(" abc\n"))
 
     def test_set_heading(self):
-        T.set_heading("T-1", "x")
-        self.assertIsNone(T.next_task())
+        tasks = self.temp / "TASKS.md"
+        tasks.write_text("### [ ] M2-30 · Layer toggles\nbody\n### [ ] M2-31 · Radar\n", encoding="utf-8")
+        with mock.patch.object(C, "TASKS", tasks):
+            T.set_heading("M2-31", "!")
+            self.assertEqual(T.next_task(tasks.read_text(encoding="utf-8")), ("M2-30", "Layer toggles"))
+            T.set_heading("M2-30", "x")
+            self.assertIsNone(T.next_task(tasks.read_text(encoding="utf-8")))
+
+    def test_spend_on_adds_up_one_day(self):
+        usage = self.temp / "usage.jsonl"
+        usage.write_text(json.dumps({"time": "2026-10-26 10:00:00", "cost_usd": 1.5}) + "\n"
+                         + json.dumps({"time": "2026-10-26 11:00:00", "cost_usd": None}) + "\n"
+                         + json.dumps({"time": "2026-10-25 11:00:00", "cost_usd": 9}) + "\nnot json\n",
+                         encoding="utf-8")
+        with mock.patch.object(C, "USAGE_LOG", usage):
+            self.assertAlmostEqual(C.spend_on("2026-10-26"), 1.5)
 
 
-class SettingsTest(DriverTest):
-    def test_defaults_and_a_bad_model(self):
-        settings = S.parse_settings(S.SETTING_DEFAULTS)
-        self.assertEqual(settings["escalate_model"], "opus")
-        self.assertEqual(settings["daily_budget_usd"], 120.0)
-        self.assertEqual(S.parse_settings(dict(S.SETTING_DEFAULTS, escalate_model="none"))["escalate_model"], "")
-        with self.assertRaises(ValueError):
-            S.parse_settings(dict(S.SETTING_DEFAULTS, escalate_model="gpt"))
+class ParsingTest(DriverTest):
+    def test_done_when_wraps_to_the_next_blank_line(self):
+        spec = "**Done when.** test `test_a` and file `loop/reviews/M2-review.md`\nand output `bot run: PASS`\n\nmore"
+        self.assertEqual(W.done_when(spec), [("test", "test_a"), ("file", "loop/reviews/M2-review.md"),
+                                             ("output", "bot run: PASS")])
 
     def test_reset_time_is_within_a_day(self):
         reset = B.reset_time("You've hit your session limit · resets 1:20pm (America/Los_Angeles)")
         self.assertTrue(time.time() < reset <= time.time() + 86400)
+        self.assertIsNone(B.reset_time("some other error"))
+
+    def test_settings_take_old_names_and_refuse_a_bad_model(self):
+        values = S.read_settings("```driver-settings\nhaiku_turns: 55\nescalate_model: none\n```")
+        self.assertEqual(values["worker_turns"], "55")
+        S.apply_settings(values)
+        self.assertEqual(S.ESCALATE_MODEL, "")
+        values["escalate_model"] = "gpt"
+        with self.assertRaises(ValueError):
+            S.apply_settings(values)
+        S.apply_settings(dict(S.SETTING_DEFAULTS))
+
+
+class WorkspaceTest(DriverTest):
+    BEFORE = "func test_a():\n\tassert_eq(1, 1)\n\tassert_true(true)\n\n\nfunc test_b():\n\tassert_true(true)\n"
+
+    def test_assert_counts_per_test_function(self):
+        text = self.BEFORE + "\n\nfunc _helper():\n\tassert_true(true)\n"
+        self.assertEqual(W.assert_counts(text), {"test_a": 2, "test_b": 1})
+
+    def test_fewer_asserts_in_a_test_the_task_does_not_name_is_weakened(self):
+        now = self.BEFORE.replace("\tassert_true(true)\n\n\nfunc test_b", "\tpass\n\n\nfunc test_b")
+        found = W.weakened(self.BEFORE, now, "spec", "game/tests/test_x.gd")
+        self.assertEqual(found, ["test_x.test_a (2 to 1 asserts)"])
+        self.assertEqual(W.weakened(self.BEFORE, now, "rewrite test_a's assert", "game/tests/test_x.gd"), [])
+        self.assertEqual(W.weakened(self.BEFORE, now, "in test_x, ...", "game/tests/test_x.gd"), [])
+
+    def test_allowed_loop_files_come_from_the_files_and_done_when_lines(self):
+        spec = ("**Files.** Change `loop/PLAYTEST.md` and `game/src/a.gd`.\n\n"
+                "**Done when.** file `loop/reviews/M3-review.md`\n")
+        self.assertEqual(W.allowed_loop_files(spec, False), {"loop/PLAYTEST.md", "loop/reviews/M3-review.md"})
+        self.assertIn("loop/TASKS.md", W.allowed_loop_files(spec, True))
+
+    def test_loop_changes_flag_the_driver_but_not_named_or_earlier_files(self):
+        snap = {"head": "abc", "dirty": {"loop/LOOP.md"}}
+        changed = {"loop/LOOP.md", "loop/driver.py", "loop/reviews/x.md", "game/src/a.gd"}
+        with mock.patch.object(C, "changed_paths", return_value=changed):
+            self.assertEqual(W.loop_changes(snap, {"loop/reviews/"}), ["loop/driver.py"])
+            self.assertEqual(W.outside_scope(snap, ["game/tests"]), ["game/src/a.gd"])
+
+    def test_a_commit_during_a_task_pauses_and_leaves_it_open(self):
+        state = R.RUNTIME["state"]
+        slot = fake_slot(base="old")
+        with mock.patch.object(C, "head", return_value="new"):
+            self.assertTrue(RN.commit_made_during(slot, "M2-08"))
+        self.assertTrue(state["paused"])
+        with mock.patch.object(C, "head", return_value="old"):
+            self.assertFalse(RN.commit_made_during(slot, "M2-08"))
+
+    def test_the_busy_slots_survive_in_driver_json(self):
+        state = {}
+        with mock.patch.object(SL, "LEASES", self.temp / "leases.json"):
+            scheduler = SC.Scheduler(state)
+            scheduler.slots["1"].task = "M3-07"
+            scheduler.slots["1"].base = "abc"
+            scheduler.save()
+        saved = R.read_driver_state()
+        self.assertEqual([(item["slot"], item["task"], item["base"]) for item in saved["slots"]], [("1", "M3-07", "abc")])
+        self.assertTrue(saved["busy"])
+
+
+class ReliabilityTest(DriverTest):
+    def test_a_hung_test_run_is_killed_and_has_no_totals(self):
+        script = self.temp / "hang.py"
+        script.write_text("import time\nprint('1 passed, 0 failed')\ntime.sleep(60)\n", encoding="utf-8")
+        with mock.patch.object(C, "TEST_COMMAND", [sys.executable, str(script)]):
+            started = time.time()
+            output = C.test_output(timeout=2)
+        self.assertLess(time.time() - started, 30)
+        self.assertEqual(C.totals_line(output), "")
+        self.assertIn("timed out", output)
+
+    def test_claude_is_the_newest_extension_copy(self):
+        for version in ("2.1.99", "2.1.311", "2.1.310"):
+            exe = self.temp / f"anthropic.claude-code-{version}-win32-x64" / "resources" / "native-binary" / "claude.exe"
+            exe.parent.mkdir(parents=True)
+            exe.write_text("")
+        with mock.patch.dict(os.environ, {"CLAUDE_EXE": ""}), mock.patch.object(C, "EXTENSIONS", self.temp), \
+                mock.patch.object(C.shutil, "which", return_value=None):
+            self.assertIn("2.1.311", C.find_claude())
+
+    def test_a_session_gets_what_is_left_of_the_day(self):
+        with mock.patch.object(C, "spend_on", return_value=110.0), mock.patch.object(S, "DAILY_BUDGET_USD", 120.0):
+            self.assertEqual(B.session_budget(30.0), 10.0)
+            self.assertTrue(R.ctx()["budget_cut"])
+            self.assertTrue(B.cut_by_daily_budget("error_max_budget_usd"))
+            B.release_reservation()
+        with mock.patch.object(C, "spend_on", return_value=10.0), mock.patch.object(S, "DAILY_BUDGET_USD", 120.0):
+            self.assertEqual(B.session_budget(30.0), 30.0)
+            self.assertFalse(B.cut_by_daily_budget("error_max_budget_usd"))
+            B.release_reservation()
+
+    def test_blocks_in_a_row_queue_a_triage_then_pause(self):
+        state = R.RUNTIME["state"]
+        state["block_streak"] = [{"task": "M2-08", "reason": "pinned"}, {"task": "M2-10", "reason": "pinned"}]
+        T.after_blocks(state)
+        self.assertIn("M2-10: pinned", state["opus_writes"][0])
+        self.assertFalse(state.get("paused"))
+        T.after_blocks(state)
+        self.assertEqual(len(state["opus_writes"]), 1)
+        state["block_streak"] += [{"task": "M2-12", "reason": "x"}, {"task": "M2-13", "reason": "x"}]
+        T.after_blocks(state)
+        self.assertTrue(state["paused"])
+        self.assertEqual(state["block_streak"], [])
+
+    def test_a_commit_ends_the_streak(self):
+        state = {"block_streak": [{"task": "a", "reason": "b"}], "triaged": True}
+        T.task_committed(state)
+        self.assertEqual((state["block_streak"], state["triaged"]), ([], False))
+
+    def test_autostart_respects_an_owner_stop(self):
+        R.write_driver_state({"ended_by": "owner"})
+        with mock.patch.object(M, "supervise") as supervise:
+            self.assertEqual(M.autostart(), 0)
+            supervise.assert_not_called()
+            R.write_driver_state({"ended_by": None})
+            M.autostart()
+            supervise.assert_called_once()
+
+    def test_runners_pick_the_opus_task_by_its_who_line(self):
+        pick = lambda spec: next(run for kind, run in RN.RUNNERS if kind(spec))  # noqa: E731
+        self.assertIs(pick("### [ ] M3-F4 · x\n**Who.** Opus\n"), RN.do_opus_task)
+        self.assertIs(pick("### [ ] M2-08 · x\n"), RN.do_worker_task)
+
+    def test_an_opus_task_asks_for_its_effort_in_an_effort_line(self):
+        self.assertEqual(RN.opus_effort("**Who.** Opus\n**Effort.** medium\n"), "medium")
+        self.assertEqual(RN.opus_effort("**Who.** Opus\n"), S.OPUS_EFFORT)
+        self.assertEqual(RN.opus_effort("**Who.** Opus\n**Effort.** loud\n"), S.OPUS_EFFORT)
+
+
+class LoopProblemTest(DriverTest):
+    def test_a_session_that_never_started_pauses_instead_of_blocking(self):
+        R.ctx()["last_session"] = {"turns": 0, "seconds": 1}
+        self.assertTrue(B.never_started("M2-20", "Your organization has disabled Claude subscription access"))
+        self.assertTrue(R.RUNTIME["state"]["paused"])
+        self.assertGreater(R.RUNTIME["state"]["resume_at"], time.time())
+        R.ctx()["last_session"] = {"turns": 12, "seconds": 1}
+        self.assertFalse(B.never_started("M2-20", "x"))
+        R.ctx()["last_session"] = {"turns": 0, "seconds": 549}
+        self.assertFalse(B.never_started("M2-30", "x"))
+
+    def test_a_failure_names_the_limit_that_stopped_it(self):
+        result = {"is_error": True, "num_turns": 40, "terminal_reason": "max_turns", "subtype": "error_max_turns"}
+        text = X.failure_text("haiku", 1, 549, result)
+        self.assertIn("stopped by max_turns after 40 turns", text)
+        self.assertNotIn("stopped by", X.failure_text("haiku", 1, 5, {"result": "boom"}))
+
+    def test_task_sessions_refuse_cd_through_their_settings(self):
+        hooks = json.loads(X.task_settings())["hooks"]["PreToolUse"][0]
+        self.assertIn("Bash", hooks["matcher"].split("|"))
+        self.assertIn("task_hook.py", hooks["hooks"][0]["command"])
+        sys.path.insert(0, str(X.TASK_HOOK.parent))
+        import task_hook
+        for command in ("cd game/src", "ls && cd game; python x", "(cd game && ls)", "pushd loop"):
+            self.assertTrue(task_hook.changes_folder(command), command)
+        for command in ('grep -rn "cd " game', "python game/tools/run_tests.py", "echo abcd"):
+            self.assertFalse(task_hook.changes_folder(command), command)
+
+    def test_a_committed_task_leaves_the_blocked_list(self):
+        progress = self.temp / "PROGRESS.md"
+        progress.write_text("## Blocked\n\n- M2-30: ran out of turns\n- M2-31: cd\n(task id: what failed)\n\n## Next\n- M2-30: kept\n",
+                            encoding="utf-8")
+        with mock.patch.object(T, "PROGRESS", progress):
+            T.clear_blocked("M2-30")
+        text = progress.read_text(encoding="utf-8")
+        self.assertNotIn("- M2-30: ran out", text)
+        self.assertIn("- M2-31: cd", text)
+        self.assertIn("- M2-30: kept", text)
+
+
+class MonitorTest(DriverTest):
+    def test_the_monitor_runs_every_few_landings_and_alerts_on_a_failure(self):
+        import monitor
+        state = R.RUNTIME["state"]
+        patch = mock.patch.object(monitor, "HISTORY", self.temp / "monitor-history.jsonl")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        def prepare(slot, fresh=False):
+            slot.base = "abc1234567"
+            return slot.base
+        with mock.patch.object(S, "MONITOR_EVERY", 2), mock.patch.object(monitor.SL, "prepare", prepare), \
+                mock.patch.object(C, "test_output", return_value="3 passed, 0 failed"), \
+                mock.patch.object(C.CFG, "monitor_command", ["bench"]), \
+                mock.patch.object(monitor.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="fast\n",
+                                                                                     stderr="")):
+            T.task_committed(state, "M3-01")
+            self.assertFalse(monitor.due(state))
+            T.task_committed(state, "M3-02")
+            self.assertTrue(monitor.due(state))
+            monitor.run(state)
+            self.assertEqual(state["monitor_pending"], [])
+            self.assertEqual(self.posts, [])
+            T.task_committed(state, "M3-03")
+            with mock.patch.object(C, "test_output", return_value="2 passed, 1 failed"):
+                monitor.run(state)
+        self.assertEqual(self.posts[-1][0], "Clean checkout fails")
+        self.assertIn("M3-03", self.posts[-1][1])
+        records = [json.loads(line) for line in monitor.HISTORY.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([record["clean"] for record in records], ["pass", "2 passed, 1 failed"])
+        self.assertEqual(records[0]["monitor_exit"], 0)
 
 
 if __name__ == "__main__":

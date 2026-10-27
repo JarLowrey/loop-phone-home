@@ -5,12 +5,17 @@ that runs on every task, so a review spends its time on what needs judgement.
 
 ## Before the questions
 
-1. Find the milestone's first commit (the review task names it) and read `git diff <commit>^ HEAD --stat`, then every
-   changed file in full, with the project rules and the milestone's part of the design.
+Every file you read stays in the conversation and is paid for again on every later turn, and a review runs for a
+hundred turns or more. Read the change, not the codebase.
+
+1. Start from the review packet the driver puts in your prompt: the commit range, the files and the top-level names it
+   changed, names a merge doubled, each task's spend and failures, the latest test totals and the Blocked list. Read
+   each file's change with `git diff <base> HEAD -- <path>`. Open a whole file only where a finding needs the code
+   around the change (grep first), and read only the parts of the design the changed code serves.
 2. Run the tests (the `test_command` in `worker.json`), and any longer check the project has (a bot, a benchmark, a
    smoke run). Keep their outputs.
-3. Read the next milestone's tasks in the task file, and this milestone's blocked tasks and the Blocked lines in the
-   progress file.
+3. For the next milestone's tasks, grep the task file's headings and read only that milestone's lines. The blocked
+   tasks are in the packet.
 
 ## The questions
 

@@ -1,68 +1,71 @@
-"""The owner's commands, from the phone and from the machine: who does the tasks, approvals, status, pause and resume,
-and the ways to stop the driver."""
+"""The owner's commands, from the phone and from the PC: who does the tasks, approvals, status, pause and resume, and the
+ways to stop the driver."""
 import os
+import pathlib
 import secrets
+import threading
 import time
 
-import budget as B
+import loop_common as C
+import opus as O
 import phone as P
 import prompts
 import runtime as R
 import sessions as X
 import settings as S
-import tasks as T
-import worker_task as W
+import slots as SL
+import workspace as W
 
-C = W.C
 COMMANDS = ("STATUS", "MAN", "STOP", "PAUSE", "RESUME", "RESTART", "WIND DOWN", "SHUTDOWN NOW")
 
 
-def task_model(state):
+def worker(state):
     """(model, effort) that do the tasks. effort is None for the model's own default."""
-    return state.get("task_model") or C.task_model, state.get("task_effort")
+    return state.get("worker_model") or S.DEFAULT_WORKER, state.get("worker_effort")
 
 
-def model_text(state):
-    model, effort = task_model(state)
+def worker_text(state):
+    model, effort = worker(state)
     return f"Tasks are done by {model}, effort {effort or 'default'}."
 
 
-def needs_approval(model, effort):
-    """True for an automated call that must wait for the phone's Approve (with approvals on): Fable at any effort, and
-    Opus at medium effort or more. The model's default effort counts as more than medium."""
-    return model == "fable" or (model == "opus" and effort != "low")
-
-
-def set_model(state, words):
+def set_worker(state, words):
     """MODEL <model> [effort] or EFFORT <level>, as upper-case words. Returns the reply for the phone."""
     if words[0] == "EFFORT":
         if len(words) < 2:
-            return f"Say EFFORT and a level: {', '.join(S.EFFORTS)} or default. " + model_text(state)
-        words = ["MODEL", task_model(state)[0].upper(), *words[1:]]
+            return f"Say EFFORT and a level: {', '.join(S.WORKER_EFFORTS)} or default. " + worker_text(state)
+        words = ["MODEL", worker(state)[0].upper(), *words[1:]]
     if len(words) == 1:
-        return model_text(state)
+        return worker_text(state)
     model = words[1].lower()
-    effort = words[2].lower() if len(words) > 2 else (state.get("task_effort") or "default")
-    if model not in S.MODEL_NAMES or effort not in S.EFFORTS + ("default",) or len(words) > 3:
-        return (f"Not changed. Models: {', '.join(S.MODEL_NAMES)}. Efforts: {', '.join(S.EFFORTS)}, default. "
-                + model_text(state))
-    state["task_model"] = model
-    state["task_effort"] = None if effort == "default" else effort
-    R.write_state(state)
-    R.log(f"task model set: {model}, effort {effort}")
-    asks = S.get("approvals") and needs_approval(model, state["task_effort"])
-    return "From the next task on. " + model_text(state) + (" Each task asks for your approval first." if asks else "")
+    effort = words[2].lower() if len(words) > 2 else (state.get("worker_effort") or "default")
+    if model not in S.WORKER_MODELS or effort not in S.WORKER_EFFORTS + ("default",) or len(words) > 3:
+        return (f"Not changed. Models: {', '.join(S.WORKER_MODELS)}. Efforts: {', '.join(S.WORKER_EFFORTS)}, "
+                "default. " + worker_text(state))
+    state["worker_model"] = model
+    state["worker_effort"] = None if effort == "default" else effort
+    R.write_driver_state(state)
+    R.log(f"worker set: {model}, effort {effort}")
+    note = (" Each task asks for your approval first." if S.APPROVALS_ON and needs_approval(model, state["worker_effort"])
+            else "")
+    return "From the next task on. " + worker_text(state) + note
 
 
-def answer_approval(state, words, from_machine):
-    """APPROVE <code> or DENY <code>. From the machine, with no code, it answers every waiting request."""
+def needs_approval(model, effort):
+    """True for an automated call that must wait for the phone's Approve: Fable at any effort, and Opus at medium
+    effort or more. The model's default effort counts as more than medium."""
+    return model == "fable" or (model == "opus" and effort != "low")
+
+
+def answer_approval(state, words, trusted_pc):
+    """APPROVE <code> or DENY <code>. From the PC, with no code, it answers every waiting request. Returns the reply."""
     answer = "approve" if words[0] == "APPROVE" else "deny"
     waiting = state.get("approvals") or {}
-    codes = [words[1].lower()] if len(words) > 1 else (list(waiting) if from_machine else [])
+    codes = [words[1].lower()] if len(words) > 1 else (list(waiting) if trusted_pc else [])
     hits = [code for code in codes if code in waiting and not waiting[code].get("answer")]
     for code in hits:
         waiting[code]["answer"] = answer
-    R.write_state(state)
+    R.write_driver_state(state)
     if not hits:
         return f"No approval request is waiting for {' '.join(words[1:]) or 'an answer'}."
     return f"{answer.capitalize()}d: " + "; ".join(waiting[code]["what"][:120] for code in hits)
@@ -71,154 +74,175 @@ def answer_approval(state, words, from_machine):
 def approved(state, what):
     """Asks the phone to approve an automated Opus or Fable call, and waits for the answer. True when it is approved. No
     answer within approval_hours counts as a denial, and so does a shutdown or WIND DOWN while waiting. With approvals
-    off in the driver-settings block, nothing is asked and the call goes ahead."""
-    if not S.get("approvals"):
+    off in the loop file, nothing is asked and the call goes ahead."""
+    if not S.APPROVALS_ON:
         R.log(f"approvals off, so not asked: {what}")
         return True
     code = secrets.token_hex(3)
-    hours = S.get("approval_hours")
     with R.STATE_LOCK:
         state.setdefault("approvals", {})[code] = {"what": what, "asked": R.now(), "answer": None}
-        R.write_state(state)
+        R.write_driver_state(state)
     R.log(f"approval {code} asked: {what}")
-    P.post("Approve this call?", f"{what}. Approve or deny (code {code}). No answer in {hours:g} h is a denial.",
-           "high", f"{P.button('Approve', 'APPROVE ' + code)}; {P.button('Deny', 'DENY ' + code)}")
-    deadline = time.time() + hours * 3600
+    P.post("Approve this call?", f"{what}. Approve or deny (code {code}). No answer in {S.APPROVAL_HOURS:g} h is a "
+           "denial.", "high", f"{P.button('Approve', 'APPROVE ' + code)}; {P.button('Deny', 'DENY ' + code)}")
+    asked = time.time()
+    deadline = asked + S.APPROVAL_HOURS * 3600
     answer = None
     while time.time() < deadline and not R.RUNTIME.get("stopping"):
         handle_commands(state)
         answer = state["approvals"][code].get("answer")
-        if answer or state.get("wind_down"):
+        if answer or state.get("exit_after"):
             break
         time.sleep(S.APPROVAL_POLL_SECONDS)
     with R.STATE_LOCK:
         state["approvals"].pop(code, None)
-        R.write_state(state)
+        R.write_driver_state(state)
     R.log(f"approval {code}: {answer or 'no answer, so denied'}")
+    if R.EMIT:
+        R.EMIT("approval", what=what[:200], seconds=round(time.time() - asked, 1), answer=answer or "none")
     return answer == "approve"
 
 
 def status_text(state):
-    """One line for the phone: whether the loop runs, what the current task is doing, who does the tasks, today's spend."""
-    paused = "paused" if state.get("paused") else "running"
-    if not state.get("busy"):
-        text = f"Loop {paused}. No task is running."
-    else:
-        text = f"Loop {paused}. Task {state.get('task')} ({state.get('mode')}), started {state.get('task_started')}."
-        if not state.get("solo"):
-            run = W.read_status()
-            if run.get("task") == state.get("task"):
-                text += f" Attempt {run.get('attempt')}: {run.get('phase_detail') or run.get('state', '')}."
+    loop_state = "paused" if state.get("paused") else "running"
+    slots = state.get("slots") or []
+    task = "; ".join(f"slot {item['slot']}: {item['task']} since {item.get('started', '?')}" for item in slots) or "none"
     waiting = len(state.get("approvals") or {})
-    text += f" {model_text(state)} Spent today: ${B.spend_on():.2f} of ${S.get('daily_budget_usd'):g}."
+    text = (f"Loop {loop_state}, {S.PARALLEL_SLOTS} slot(s). Running: {task}. {worker_text(state)} Spent today: "
+            f"${C.spend_on():.2f} of ${S.DAILY_BUDGET_USD:g}.")
     return text + (f" Waiting for {waiting} approval(s)." if waiting else "")
 
 
-def machine_requests():
-    """The commands --model, --approve and --deny left in the request file, as (id, text) like the phone's, with an
-    empty id. The file is emptied."""
-    path = R.PATHS["request"]
-    if not path.exists():
+def pc_requests():
+    """The commands --model, --approve and --deny left in REQUEST_FILE, as (id, text) like the phone's, with an empty
+    id. The file is emptied."""
+    if not R.REQUEST_FILE.exists():
         return []
-    lines = path.read_text(encoding="utf-8").splitlines()
-    path.unlink(missing_ok=True)
+    lines = R.REQUEST_FILE.read_text(encoding="utf-8").splitlines()
+    R.REQUEST_FILE.unlink(missing_ok=True)
     return [("", line) for line in lines if line.strip()]
 
 
+def poll_messages():
+    return P.poll_messages(S.INBOX_WINDOW)
+
+
 def handle_commands(state):
-    """Reads the phone's inbox and the machine's request file, and does each command in them. Each message is read
-    once. A message that is not a command is ignored; a short one is logged, in case it was a typo, and a long one (such
-    as the driver's own replies) is not."""
+    """Answers the phone's commands, and the ones the PC left in REQUEST_FILE. Every other message is only logged."""
     with R.STATE_LOCK:
-        seen = W.read_seen()
-        for message_id, text in machine_requests() + W.poll_inbox():
+        for message_id, text in pc_requests() + poll_messages():
             if message_id:
-                if message_id in seen:
-                    continue
-                W.mark_seen(message_id)
-                seen.add(message_id)
+                P.mark_seen(message_id)
+            text = text.strip()
             words = text.upper().split()
-            command = " ".join(words)
-            if words and words[0] in ("MODEL", "EFFORT"):
-                R.log(f"command {command}")
-                P.post("Loop task model", set_model(state, words))
+            if not words:
                 continue
-            if words and words[0] in ("APPROVE", "DENY"):
+            command = " ".join(words)
+            if command.startswith("OPUS WRITE:"):
+                O.queue_opus_write(state, text[len("OPUS WRITE:"):].strip())
+                continue
+            if command.startswith("OPUS:"):
+                O.ask_opus(text[len("OPUS:"):].strip())
+                continue
+            if words[0] in ("MODEL", "EFFORT"):
+                R.log(f"command {command}")
+                P.post("Loop worker", set_worker(state, words))
+                continue
+            if words[0] in ("APPROVE", "DENY"):
                 R.log(f"command {command}")
                 P.post("Approval", answer_approval(state, words, not message_id))
                 continue
             if command not in COMMANDS:
-                if len(text) <= 40:
-                    R.log(f"inbox message is not a command, ignored: {text!r}")
+                R.log(f"inbox message ignored: {text[:80]!r}")
                 continue
             R.log(f"command {command}")
             if command == "STATUS":
                 P.post("Loop status", status_text(state))
             elif command == "MAN":
                 P.post("Commands", prompts.MAN_TEXT)
-            elif command == "WIND DOWN":
-                state["wind_down"] = True
-                R.write_state(state)
-                P.post("Loop will exit", "The driver ends once the current task is committed or undone.")
             elif command == "SHUTDOWN NOW":
-                P.post("Loop shutting down", "Killing the running session and ending the driver now.", "high")
+                P.post("Loop shutting down", "Stopping the running sessions and the driver now.")
                 shut_down(state, "SHUTDOWN NOW from the phone")
+                if threading.current_thread() is not threading.main_thread():
+                    # why: a slot's thread waiting on an approval read it; SystemExit there would end only that thread
+                    R.DRIVER_PID.unlink(missing_ok=True)
+                    os._exit(0)
                 raise SystemExit(0)
+            elif command == "WIND DOWN":
+                state["exit_after"] = True
+                R.write_driver_state(state)
+                P.post("Loop will exit", "The driver ends once the running tasks are landed or undone.")
             elif command in ("STOP", "PAUSE"):
                 state["paused"] = True
-                R.write_state(state)
+                R.write_driver_state(state)
                 P.post("Loop paused", "No new task starts until you send RESUME.")
             else:
-                state.update({"paused": False, "resume_at": None})
-                R.write_state(state)
+                state["paused"] = False
+                state["resume_at"] = None
+                R.write_driver_state(state)
                 P.post("Loop resumed", "Carrying on with the next open task.")
+                if R.EMIT:
+                    R.EMIT("resume", reason=f"{command} from the owner")
 
 
 X.HANDLE_COMMANDS = handle_commands
 
 
 def shut_down(state, reason):
-    """Kills the running session, undoes the unfinished task, and marks the driver paused and ended by its owner. The
-    stopping flag is set first, so the thread that was waiting on the session does not also undo or mark the task."""
+    """Kills every running session and its children, reverts the unfinished tasks in their slots, and leaves the driver
+    paused. The stopping flag is set first, so the threads waiting on the killed sessions do not also block the tasks."""
     R.RUNTIME["stopping"] = True
-    W.kill_tree(R.CHILD["pid"])
-    R.CHILD["pid"] = None
-    if state.get("busy"):
-        T.revert_unfinished()
-    state.update({"busy": False, "paused": True, "ended_by": "owner"})
-    R.write_state(state)
+    for pid in list(R.CHILDREN.values()):
+        X.kill_tree(pid)
+    R.CHILDREN.clear()
+    for pid in list(O.OPUS_CHILDREN):
+        O.OPUS_KILLED.add(pid)
+        X.kill_tree(pid)
+    scheduler = R.RUNTIME.get("scheduler")
+    for slot in scheduler.busy() if scheduler else []:
+        SL.revert(slot)
+    state["slots"] = []
+    state["task"] = None
+    state["busy"] = False
+    state["paused"] = True
+    state["ended_by"] = "owner"
+    R.write_driver_state(state)
     R.log(f"shut down: {reason}")
-
-
-def running_driver():
-    """The pid of another driver or supervisor that is still running from this folder, or 0."""
-    for key in ("supervisor", "pid"):
-        other = R.read_pid(R.PATHS[key])
-        if other and other != os.getpid() and W.pid_alive(other):
-            return other
-    return 0
+    if R.EMIT:
+        R.EMIT("driver_stop", reason=reason)
 
 
 def cli_shutdown():
-    """--shutdown: stops the supervisor, the driver and its session, from the machine they run on. The supervisor goes
-    first, so it does not start again the driver it sees end."""
-    state = R.read_state()
-    for pid in (R.read_pid(R.PATHS["supervisor"]), R.read_pid(R.PATHS["pid"]), state.get("child_pid")):
-        if pid and W.pid_alive(pid):
-            W.kill_tree(pid)
-    if state.get("busy"):
-        T.revert_unfinished(state)
-    state.update({"busy": False, "paused": True, "child_pid": None, "approvals": {}, "ended_by": "owner"})
-    R.write_state(state)
-    R.PATHS["supervisor"].unlink(missing_ok=True)
-    R.PATHS["pid"].unlink(missing_ok=True)
-    R.log("shut down from the machine")
+    """python <runner>/driver --shutdown: stops the supervisor and the driver from the PC. The supervisor goes first, so it
+    does not restart the driver it sees end."""
+    S.refresh()
+    state = R.read_driver_state()
+    X.kill_tree(R.read_pid(R.SUPERVISOR_PID))
+    X.kill_tree(R.read_pid(R.DRIVER_PID))
+    for pid in state.get("child_pids") or [state.get("child_pid")]:
+        X.kill_tree(pid)
+    for item in state.get("slots") or []:
+        root = pathlib.Path(item["root"])
+        if (root / ".git").exists():
+            W.undo_changes(sorted(C.changed_paths(root)), C.LOGS, root)
+    state["ended_by"] = "owner"
+    state["busy"] = False
+    state["paused"] = True
+    state["slots"] = []
+    state["task"] = None
+    state["child_pids"] = []
+    state["approvals"] = {}
+    R.write_driver_state(state)
+    R.SUPERVISOR_PID.unlink(missing_ok=True)
+    R.DRIVER_PID.unlink(missing_ok=True)
+    R.log("shut down from the PC")
     print("driver shut down; nothing is running from it. Start it again with python <runner>/driver")
 
 
 def queue_request(text):
     """--model, --approve, --deny: leaves the command for the driver, which reads it on its next poll or start."""
-    with open(R.PATHS["request"], "a", encoding="utf-8", newline="\n") as requests:
+    R.REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(R.REQUEST_FILE, "a", encoding="utf-8", newline="\n") as requests:
         requests.write(text + "\n")
     print(f"queued {text!r}: the driver applies it on its next poll, or when it next starts. "
-          "The reply goes to the phone and driver.log.")
+          "The reply goes to the phone and driver.log in the logs folder.")

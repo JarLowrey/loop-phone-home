@@ -9,35 +9,50 @@ task's code yourself. If the worker fails a task, that is the result, not a reas
 
 ## Driver
 
-`python <runner>/driver` runs this loop without an orchestrating session. It does the steps below in code, and it
-reads the settings block that follows. It does not do the `ANSWER`, `APPROVED` or `REJECTED` commands, or the `[?]`
-tasks: those need an orchestrating session. `python <runner>/driver --shutdown` stops a running driver from the
-machine. The README lists every phone command the driver answers.
+`python <runner>/driver` runs this loop without an orchestrating session: each open task is one Claude session in a
+git worktree of its own, and its work lands only when the driver's own checks pass. It reads the settings block below.
+It does not do the `ANSWER`, `APPROVED` or `REJECTED` commands, the `[?]` tasks or the local-model worker: those need
+an orchestrating session. `python <runner>/driver --shutdown` stops it from the machine. The README lists every phone
+command it answers.
+
+**Your edits and the driver.** Tasks run in worktrees, never in your tree, so edit freely while the driver runs. It
+reads only committed work: an edit to the task file counts once you commit it. When one of your uncommitted files is
+in the way of a landing, the driver waits and tells the phone which.
 
 ## Driver settings
 
-If the driver runs the loop, it reads this block. Each value is read again at each pass, so an edit takes effect
-without a restart.
+The driver reads this block again at each pass, so an edit takes effect without a restart.
 
 ```driver-settings
 poll_seconds: 60
-max_attempts: 3
-retry_states: tests_failed, failed, looped, timed_out, tests_did_not_run
 escalate_model: opus
 daily_budget_usd: 120
 approval_hours: 12
 approvals: on
+monitor_every: 5
+parallel_slots: 1
+parallel_window: 4
+shared_files:
+max_requeues: 2
+commit_digest: 4
 ```
 
-- `poll_seconds`: how often the driver answers the phone while it waits (5 at least).
-- `max_attempts`: attempts for a task in `--worker` mode, counting the first. A state in `retry_states` is retried with
-  the test output; any other state blocks the task.
-- `escalate_model`: in the default mode one session of `task_model` does each task; a failed task is undone and this
-  model tries it once more (`none` turns that off). With approvals on, an Opus or Fable retry asks the phone first.
-- `daily_budget_usd`: the driver pauses until midnight once a day's recorded spending reaches it (0 turns it off).
-- `approval_hours`: how long an approval request waits before it counts as a denial.
-- `approvals`: `on` makes automated Opus (medium effort or more) and Fable calls wait for the phone's Approve; `off`
-  lets them run within their budgets.
+- `poll_seconds`: how often the driver answers the phone.
+- `escalate_model`: a failed task is undone and this model tries it once more (`none` turns that off).
+- `daily_budget_usd`: the driver pauses until midnight once a day's spending reaches it (0 turns it off).
+- `approval_hours`, `approvals`: with approvals `on`, automated Opus (medium effort or more) and Fable calls wait this
+  long for the phone's Approve.
+- `monitor_every`: after this many landed tasks, the tests run in a fresh checkout, then `monitor_command` if the config
+  names one (0 turns it off).
+- `parallel_slots`: tasks side by side, each in its own worktree. `parallel_window`: how far ahead of the oldest
+  running task the scheduler looks. `shared_files`: files two running tasks may both change, as long as their specs
+  name different functions of them. `max_requeues`: landings a task may miss before it runs alone.
+  `python <runner>/driver/simulate.py` shows what these do to your queue.
+- `commit_digest`: landed tasks per phone message.
+
+**Task format the driver reads.** Each task has a **Files.** line (the scheduler keeps two tasks that share a file
+apart), a **Done when.** line, and optionally **Who.** Opus, **Effort.**, and **After.** naming earlier tasks it
+builds on. For a shared file, name the functions the task changes in brackets: `src/sim.py` (`end_fight`).
 
 ## Milestone reviews with Opus
 

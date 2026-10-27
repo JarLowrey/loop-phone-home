@@ -1,302 +1,274 @@
-"""Running one task: the snapshot it starts from, the session or worker run that does it, the gate its work must pass,
-and the commit, retry or block that follows. RUNNERS lists the kinds of task; a new kind is one more row. The triage
-after a run of blocks is here too, since it passes the same gate."""
+"""Running one task in its slot: the session that does it, the gate its work must pass, and the landing, retry, requeue
+or block that follows. RUNNERS lists the kinds of task; a new kind is one more row."""
 import datetime
 import re
-import subprocess
-import sys
-import time
 import traceback
 
 import budget as B
 import commands as K
+import events as E
+import leases as L
+import loop_common as C
+import packet as PK
 import phone as P
 import prompts
 import runtime as R
 import sessions as X
 import settings as S
+import slots as SL
 import tasks as T
-import workspace as WS
-import worker_task as W
-
-C = W.C
+import workspace as W
 
 
-def rules_text():
-    path = C.project / C.rules_file
-    return path.read_text(encoding="utf-8") if path.exists() else "(no rules file)"
+class Requeue(str):
+    """Why a task's work could not land: a conflict with work that landed meanwhile, or a file another running task
+    held (wait_for names those tasks; the task waits until they land). The task goes back to the queue; the model is
+    not at fault, so it does not escalate."""
+
+    def __new__(cls, reason, wait_for=()):
+        made = super().__new__(cls, reason)
+        made.wait_for = list(wait_for)
+        return made
 
 
-def check_passed(run, spec="", opus=False, require_done_when=False):
-    """What a commit needs, checked here against the task's snapshot and not taken from the session's word: nothing
-    changed outside the scope, no loop-folder file the task does not name, no test removed or making fewer asserts
-    unless the task names it, the test run passes now, and the Done when line holds. The tests run once; an Opus task or
-    a triage that changed nothing in the scope skips them. Returns (reason, totals); the reason is empty on a pass."""
-    snap = R.current_snap()
-    extra = WS.outside_scope(snap)
+def rules_text(root):
+    """The project rules file (rules_file) as the slot has it, or '' when the project has none."""
+    path = root / C.CFG.rules_file
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def check_passed(slot, spec, opus=False):
+    """What a commit needs, checked here in the task's slot and not taken from the session's word: nothing changed
+    outside the scope, no loop-folder file the task does not name, no test removed or making fewer asserts unless the
+    task names it, the test run passes now, and the task's Done when line holds. The tests run once; an
+    Opus task that changed nothing in the scope skips them. Returns (reason to block or '', the totals line).
+    The gate's time, its test run's time and output, and its verdict go to events.jsonl; the output is kept in
+    <logs>/<task>.gate.<time>.log, and kept for a retry's feedback."""
+    timer = E.Timer()
+    found = {"test_seconds": 0.0, "output": ""}
+    reason, totals = gate(slot, spec, opus, found)
+    log = ""
+    if found["output"]:
+        log = f"{R.ctx().get('task', 'task')}.gate.{E.stamp()}.log"
+        (C.LOGS / log).write_text(found["output"] + "\n", encoding="utf-8", newline="\n")
+    E.emit("gate", seconds=timer.seconds(), test_seconds=found["test_seconds"], totals=totals, reason=reason, log=log)
+    return reason, totals
+
+
+def gate(slot, spec, opus, found):
+    """check_passed's checks, in order; found gets the test run's time and output."""
+    snap, root = slot.snap(), slot.root
+    extra = W.outside_scope(snap, S.SCOPE, root)
     if extra:
         return f"changed outside the scope: {', '.join(extra[:3])}", ""
-    stray = WS.loop_changes(snap, WS.allowed_loop_files(spec, opus))
+    stray = W.loop_changes(snap, W.allowed_loop_files(spec, opus), root)
     if stray:
-        return f"changed files in {WS.loop_folder()} the task does not name: {', '.join(stray[:3])}", ""
-    if run.get("tests_removed"):
-        return f"{run['tests_removed']} tests were removed", ""
-    before, after = R.RUNTIME.get("tests_before"), W.count_tests()
-    if before is not None and after is not None and after < before:
-        return f"tests were removed: {before} before the task, {after} now", ""
-    removed = WS.removed_tests(snap)
+        return f"changed loop-folder files the task does not name: {', '.join(stray[:3])}", ""
+    removed = W.removed_tests(snap, root)
     if removed:
         return f"test functions were removed: {', '.join(removed[:5])}", ""
-    loosened = WS.weakened_tests(snap, spec)
+    loosened = W.weakened_tests(snap, spec, root)
     if loosened:
         return f"tests the task does not name make fewer asserts: {', '.join(loosened[:5])}", ""
-    output, totals = "", "-"
-    if not opus or any(W.in_scope(path) for path in WS.task_changes(snap)):
-        output = X.run_tests()
-        totals = W.totals_line(output)
-        if not totals or C.pass_marker not in totals:
-            return f"the driver's own test run: {totals or output[:200] or 'no totals printed'}", totals
-    return WS.check_done_when(spec, output, require_done_when), totals
+    output, totals = "", ""
+    if not opus or C.code_changed(W.task_changes(snap, root)):
+        tests = E.Timer()
+        output = X.run_tests(root)
+        found.update(test_seconds=tests.seconds(), output=output)
+        R.ctx()["last_test_output"] = output
+        totals = C.totals_line(output)
+        failure = C.test_failure(output)
+        if failure:
+            return f"the driver's own test run: {failure}", totals
+    return W.check_done_when(spec, output, root), totals
 
 
-def commit_made_during(task_id):
-    """True when a commit was made while the task ran (by hand, or by a session that got round the deny list). The
-    task's work may be in it, out of the checks' reach, so the driver neither judges nor commits it: it pauses with the
-    changes left as they are, and the task stays open."""
-    snap = R.current_snap()
-    if not WS.head_moved(snap):
+def commit_made_during(slot, task_id):
+    """True when a commit was made in the slot while the task ran (by a session that got round the deny list). The
+    task's work may be in it, out of the checks' reach, so the driver neither judges nor lands it: it pauses, and the
+    task stays open. The next start of the slot saves and undoes what is there."""
+    if C.head(slot.root) == slot.base:
         return False
-    R.log(f"HEAD moved during {task_id} (from {snap['head'][:8]} to {WS.head()[:8]}); pausing")
-    P.pause(R.RUNTIME["state"], "Driver paused: a commit was made during a task", f"HEAD moved while {task_id} ran, so "
-            "the driver did not check or commit it. Its uncommitted changes are left in place. Look at git log, then "
-            "send RESUME: the task starts again, and leftovers in the scope are saved and undone first.", "urgent")
+    R.log(f"a commit was made in slot {slot.name} during {task_id} (from {slot.base[:8]} to {C.head(slot.root)[:8]}); "
+          "pausing")
+    R.pause(R.RUNTIME["state"], "Driver paused: a commit was made during a task", f"{task_id}'s session committed in "
+            f"its slot ({slot.root}), so the driver did not check or land it. Look at git log there, then send RESUME: "
+            "the task starts again from a clean slot.", "urgent")
     return True
 
 
-def model_attempt(task_id, title, spec, model, effort, feedback):
-    """One session of the model does the task. Returns None when nothing more is to be done (committed, stopped, or a
-    limit paused the driver), or the reason it failed."""
-    W.CURRENT_TASK["id"] = task_id
-    prompt = prompts.TASK_PROMPT.format(brief=C.project_brief, scope=", ".join(C.scope), loop=WS.loop_folder(),
-                                        test_command=C.test_command_text, rules_file=C.rules_file, rules=rules_text(),
-                                        task=spec)
+def land(slot, state, task_id, title, message, paths, row):
+    """Commits the checked work in the slot and lands it with the task's marks. Returns '' or a Requeue."""
+    SL.commit_work(slot, message, paths)
+    failed = SL.integrate(slot, message, T.done_marks(task_id, row))
+    if failed:
+        return Requeue(failed)
+    R.ctx().update(outcome="landed", reason="")
+    T.task_committed(state, task_id)
+    return ""
+
+
+def worker_attempt(slot, task_id, title, spec, model, effort, feedback):
+    """One session of the model does the task. Returns None when nothing more is to be done (landed, stopped, or a limit
+    paused the driver), a Requeue when the checked work could not land, or the reason it failed."""
+    R.log(f"worker starts: {task_id}: {title} ({model}, effort {effort or 'default'}, slot {slot.name})")
+    prompt = prompts.WORKER_PROMPT.format(rules=rules_text(slot.root), task=C.task_context(spec))
     if feedback:
-        prompt += prompts.FEEDBACK_NOTE.format(model=feedback[0], reason=feedback[1], tests=X.test_output()[-4000:])
-    R.log(f"task starts: {task_id}: {title} ({model}, effort {effort or 'default'}, {len(prompt)} characters, "
-          f"up to {C.task_turns} turns, ${S.MODEL_BUDGET_USD[model]:g})")
-    text, error = X.run_session(prompt, task_id, model, effort, C.task_turns, C.task_timeout,
-                                B.session_budget(S.MODEL_BUDGET_USD[model]), "task")
+        prompt += prompts.FEEDBACK_NOTE.format(model=feedback[0], reason=feedback[1],
+                                               tests=X.tests_summary(R.ctx().get("last_test_output", "")))
+    R.log(f"worker prompt: {len(prompt)} characters, up to {S.WORKER_TURNS} turns, {S.WORKER_TIMEOUT} s, "
+          f"${S.WORKER_BUDGET_USD[model]:g}")
+    text, error = X.run_session(prompt, task_id, model, effort, S.WORKER_TURNS, S.WORKER_TIMEOUT,
+                                B.session_budget(S.WORKER_BUDGET_USD[model]), "worker", slot)
     if R.RUNTIME.get("stopping"):
         return None
-    (C.logs / f"{task_id}.{model}.md").write_text((text or error) + "\n", encoding="utf-8", newline="\n")
-    if commit_made_during(task_id):
+    (C.LOGS / f"{task_id}.{model}.{E.stamp()}.md").write_text((text or error) + "\n", encoding="utf-8", newline="\n")
+    if commit_made_during(slot, task_id):
         return None
     if error:
-        if B.hit_usage_limit(task_id, error, R.RUNTIME["state"]) or B.cut_by_daily_budget(error):
-            T.revert_unfinished()
+        if B.hit_usage_limit(task_id, error) or B.cut_by_daily_budget(error) or B.never_started(task_id, error):
+            SL.revert(slot)
             return None
         return f"{model} could not do it: {error}"
-    reason, totals = check_passed({}, spec)
+    behind = SL.catch_up(slot)
+    if behind:
+        return Requeue(behind)
+    reason, totals = check_passed(slot, spec)
     if reason:
-        R.log(f"task check failed: {reason}")
+        R.log(f"worker check failed: {reason}")
+        held = L.refusals(SL.LEASES, slot.name)
+        if held:
+            return Requeue(f"it needed {', '.join(f'{file} (held by {task})' for file, task in held[:3])}: {reason}",
+                           [task for _, task in held])
         return reason
-    name = S.MODEL_NAMES[model]
-    body = f"Written by {name} (effort {effort or 'default'}), checked by the driver.\n\nIts own summary:\n{text[:1500]}"
-    T.finish_with_commit(task_id, title, totals, body, f"\n\nCo-Authored-By: {name} <noreply@anthropic.com>",
-                         sorted(WS.allowed_loop_files(spec, False)) + WS.done_files(spec))
+    R.log(f"worker checks passed ({totals}): scope, loop files, tests kept, tests, done when; landing")
+    name = S.WORKER_MODELS[model]
+    message = (f"{task_id}: {title}\n\nWritten by {name} (effort {effort or 'default'}), checked by the driver.\n\n"
+               f"Its own list:\n{text[:1500]}\n\nCo-Authored-By: {name} <noreply@anthropic.com>\n")
+    row = (f"| {datetime.date.today().isoformat()} | {task_id} | done | {totals} | 1 attempt(s) · {title} · "
+           f"{model} |")
+    failed = land(slot, R.RUNTIME["state"], task_id, title, message,
+                  S.SCOPE + sorted(W.allowed_loop_files(spec, False)) + W.done_files(spec), row)
+    if failed:
+        return failed
+    T.announce(R.RUNTIME["state"], f"{task_id} {title}: {totals} ({model})")
     return None
 
 
-def model_task(task_id, title, spec, state):
-    """The task model does the task. If it fails, its changes are undone and the escalation model tries once, with the
-    failure as feedback. A second failure blocks the task. With approvals on, an Opus or Fable attempt waits for
-    approval first."""
-    model, effort = K.task_model(state)
-    escalate = S.get("escalate_model")
+def do_worker_task(slot, task_id, title, spec, state):
+    """The worker model does the task. If it fails, its changes are undone and the escalation model tries once, with the
+    failure as feedback. A second failure blocks the task. Work that passed but could not land is requeued. With
+    approvals on, an Opus or Fable attempt waits for approval first."""
+    model, effort = K.worker(state)
     plan = [(model, effort)]
-    if escalate and S.MODEL_RANK[escalate] > S.MODEL_RANK[model]:
-        plan.append((escalate, effort))
+    if S.ESCALATE_MODEL and S.MODEL_RANK[S.ESCALATE_MODEL] > S.MODEL_RANK[model]:
+        plan.append((S.ESCALATE_MODEL, effort))
     reason = ""
     for index, (who, level) in enumerate(plan):
         if K.needs_approval(who, level) and not K.approved(
-                state, f"{task_id} {title}: {who}, effort {level or 'default'}, up to ${S.MODEL_BUDGET_USD[who]:g}"):
+                state, f"{task_id} {title}: {who}, effort {level or 'default'}, up to ${S.WORKER_BUDGET_USD[who]:g}"):
             if index == 0:
-                P.pause(state, "Loop paused: not approved", f"{task_id} stays open. Send RESUME to ask again, or MODEL "
-                        "sonnet to use another model.")
+                R.pause(state, "Loop paused: not approved", f"{task_id} stays open. Send RESUME to ask again, or "
+                        "MODEL sonnet to use another model.")
                 return
             reason += f" (the retry by {who} was not approved)"
             break
         if index:
-            T.revert_unfinished()
+            SL.prepare(slot)
             R.log(f"{task_id}: {plan[index - 1][0]} failed ({reason}); {who} tries it once")
-        reason = model_attempt(task_id, title, spec, who, level, (plan[index - 1][0], reason) if index else None)
-        if reason is None:
+            E.emit("escalate", **{"from": plan[index - 1][0], "to": who, "reason": reason[:400]})
+        result = worker_attempt(slot, task_id, title, spec, who, level,
+                                (plan[index - 1][0], reason) if index else None)
+        if result is None:
             return
-    T.block(task_id, reason, "task_failed")
-
-
-def run_worker(task_id, state, feedback=None):
-    """Runs worker_task.py for a task and returns its status once it has ended."""
-    command = [sys.executable, R.PATHS["worker"], task_id]
-    if feedback:
-        command.append(str(feedback))
-    R.log(f"worker starts: {task_id}" + (" (a retry, with the test output)" if feedback else ""))
-    before = C.status_file.stat().st_mtime if C.status_file.exists() else 0
-    group = {} if sys.platform == "win32" else {"start_new_session": True}
-    process = subprocess.Popen(command, cwd=C.project, env=T.driver_env(), **group)
-    R.CHILD["pid"] = process.pid
-    with X.polling():
-        while process.poll() is None:
-            time.sleep(2)
-    R.CHILD["pid"] = None
-    if not C.status_file.exists() or C.status_file.stat().st_mtime <= before:
-        R.log(f"worker did not start {task_id} (exit {process.returncode}); its status file did not change")
-        return {"state": "not_started"}
-    run = R.read_json(C.status_file)
-    R.log(f"worker ends: {task_id}: state {run.get('state')}, exit {process.returncode}")
-    return run
-
-
-def worker_task(task_id, title, spec, state):
-    """Runs the worker on a task. A state that allows it is retried with the test output, up to max_attempts. A task
-    that passes is committed; anything else is blocked."""
-    feedback = None
-    while True:
-        run = run_worker(task_id, state, feedback)
-        if commit_made_during(task_id):
+        if isinstance(result, Requeue):
+            T.requeue(slot, task_id, result, state, result.wait_for)
             return
-        outcome = run.get("state")
-        if outcome == "passed":
-            reason, totals = check_passed(run, spec)
-            if reason:
-                T.block(task_id, reason, outcome)
-                return
-            T.finish_with_commit(task_id, title, totals, f"Written by the worker (attempt {run.get('attempt', 1)}).",
-                                 extra_paths=sorted(WS.allowed_loop_files(spec, False)) + WS.done_files(spec))
-            return
-        if outcome in ("stopped", "not_started"):
-            state["paused"] = True
-            R.write_state(state)
-            R.log(f"{task_id} was {outcome}: paused, the task stays open")
-            return
-        if outcome in S.get("retry_states") and run.get("attempt", 1) < S.get("max_attempts"):
-            feedback = C.logs / f"{task_id}.feedback.txt"
-            feedback.write_text(f"The last attempt ended in state {outcome}. Its test output:\n"
-                                f"{X.test_output()[-4000:]}\n", encoding="utf-8", newline="\n")
-            R.log(f"{task_id} will be retried with its test output (attempt {run.get('attempt', 1) + 1})")
-            continue
-        T.block(task_id, f"state {outcome}" + (f", {run.get('totals')}" if run.get("totals") else ""), outcome)
-        return
+        reason = result
+    T.block(slot, task_id, title, reason, "worker_failed")
 
 
 def is_opus_task(spec):
-    """A task whose Who line says Opus is a review or planning task: Opus does it once, at high effort."""
+    """A task whose Who line says Opus is a review or a task revision: Opus does it once, at the effort its Effort line
+    names (high without one)."""
     return bool(re.search(r"^\*\*Who\.\*\* Opus\b", spec, re.M))
 
 
-def do_opus_task(task_id, title, spec, state):
+def opus_effort(spec):
+    """The effort an Opus task asks for in an **Effort.** line (low, medium, high, xhigh or max), else OPUS_EFFORT."""
+    match = re.search(r"^\*\*Effort\.\*\* (\w+)", spec, re.M)
+    return match.group(1).lower() if match and match.group(1).lower() in S.WORKER_EFFORTS else S.OPUS_EFFORT
+
+
+def do_opus_task(slot, task_id, title, spec, state):
     """Runs a task marked Opus in one session (once the phone approves it, with approvals on). Its work must pass the
-    same gate as a task model's, with the task and progress files also allowed and the Done when line required; then
-    everything it changed since the snapshot is committed."""
-    if not K.approved(state, f"{task_id} {title}: Opus, effort {S.OPUS_EFFORT}, up to ${S.OPUS_TASK_BUDGET_USD:g}"):
-        P.pause(state, "Loop paused: not approved", f"{task_id} stays open. Send RESUME to ask again.")
+    same gate as a worker's, with the task and progress files also allowed; otherwise every change is undone and the
+    task is blocked. Then everything it changed is landed. Work that passed but cannot land is kept on a held/ branch
+    for the owner, since running Opus again costs far more than a merge by hand."""
+    effort = opus_effort(spec)
+    if not K.approved(state, f"{task_id} {title}: Opus, effort {effort}, up to ${S.OPUS_TASK_BUDGET_USD:g}"):
+        R.pause(state, "Loop paused: not approved", f"{task_id} stays open. Send RESUME to ask again.")
         return
-    W.CURRENT_TASK["id"] = task_id
-    prompt = prompts.OPUS_TASK_PROMPT.format(rules=rules_text(), test_command=C.test_command_text, task=spec)
-    R.log(f"opus task starts: {task_id}: {title}")
-    text, error = X.run_session(prompt, task_id, S.OPUS_MODEL, S.OPUS_EFFORT, S.OPUS_TASK_TURNS, S.OPUS_TASK_TIMEOUT,
-                                B.session_budget(S.OPUS_TASK_BUDGET_USD), "opus")
+    R.log(f"opus task starts: {task_id}: {title} (slot {slot.name})")
+    prompt = prompts.OPUS_TASK_PROMPT.format(rules=rules_text(slot.root), task=spec)
+    if PK.is_review(task_id):
+        review = PK.safe_build(task_id, spec)
+        (C.LOGS / f"{task_id}.packet.{E.stamp()}.md").write_text(review, encoding="utf-8", newline="\n")
+        prompt += prompts.PACKET_NOTE.format(packet=review)
+    text, error = X.run_session(prompt, task_id, S.OPUS_MODEL, effort, S.OPUS_TASK_TURNS, S.OPUS_TASK_TIMEOUT,
+                                B.session_budget(S.OPUS_TASK_BUDGET_USD), "opus", slot)
     if R.RUNTIME.get("stopping"):
         return
-    (C.logs / f"{task_id}.opus.md").write_text((text or error) + "\n", encoding="utf-8", newline="\n")
-    if commit_made_during(task_id):
+    (C.LOGS / f"{task_id}.opus.{E.stamp()}.md").write_text((text or error) + "\n", encoding="utf-8", newline="\n")
+    if commit_made_during(slot, task_id):
         return
-    if error and (B.hit_usage_limit(task_id, error, state) or B.cut_by_daily_budget(error)):
-        T.revert_unfinished()
+    if error and (B.hit_usage_limit(task_id, error) or B.cut_by_daily_budget(error) or B.never_started(task_id, error)):
+        SL.revert(slot)
         return
-    reason, totals = (f"Opus could not do it: {error}", "-") if error else check_passed({}, spec, True, True)
+    reason = f"Opus could not do it: {error}" if error else check_passed(slot, spec, opus=True)[0]
     if reason:
-        T.block(task_id, reason, "opus_failed")
+        T.block(slot, task_id, title, reason + ". Every change was undone; copies are in <logs>/revert-*.",
+                "opus_failed")
         return
-    T.set_heading(task_id, "x")
-    T.add_progress(row=f"| {datetime.date.today().isoformat()} | {task_id} | done | {totals} | {title} · Opus |")
-    paths = sorted(set(WS.task_changes(R.current_snap())) | {C.tasks_file, C.progress_file})
-    T.commit(f"{task_id}: {title}\n\n{(text or '')[:1500]}\n\nCo-Authored-By: {S.MODEL_NAMES['opus']} "
-             "<noreply@anthropic.com>\n", paths)
-    P.post("Committed", f"{task_id} {title} (Opus)")
-    T.task_committed(state)
-
-
-def run_triage(state, blocked):
-    """Opus looks for what a run of blocked tasks shares, between tasks, and may fix it or rewrite the tasks. Its work
-    passes the same gate as an Opus task's, then is committed, or undone if it fails."""
-    state.pop("triage", None)
-    snap = WS.snapshot()
-    R.set_snap(state, snap)
-    W.CURRENT_TASK["id"] = "triage"
-    prompt = prompts.TRIAGE_PROMPT.format(blocked=blocked, logs=C.logs_dir, progress_file=C.progress_file,
-                                          tasks_file=C.tasks_file, test_command=C.test_command_text, rules=rules_text())
-    R.log(f"triage starts: {blocked[:200]!r}")
-    name = f"triage-{time.strftime('%Y%m%d-%H%M%S')}"
-    text, error = X.run_session(prompt, name, S.OPUS_MODEL, S.OPUS_EFFORT, S.TRIAGE_TURNS, S.TRIAGE_TIMEOUT,
-                                B.session_budget(S.TRIAGE_BUDGET_USD), "triage")
-    try:
-        if R.RUNTIME.get("stopping") or commit_made_during("the triage"):
-            return
-        changed = WS.task_changes(snap)
-        reason = f"Opus could not do it: {error}" if error else (check_passed({}, "", True)[0] if changed else "")
-        if reason:
-            T.revert_unfinished()
-            P.post("Triage undone", f"{reason[:300]}. Its summary is in {C.logs_dir}/{name}.triage.jsonl.", "high")
-            return
-        if not changed:
-            P.post("Triage: no change", (text or "No shared cause found.")[:400])
-            return
-        T.commit(f"Triage of blocked tasks\n\n{blocked}\n\n{(text or '')[:1500]}\n\nCo-Authored-By: "
-                 f"{S.MODEL_NAMES['opus']} <noreply@anthropic.com>\n", sorted(set(changed)))
-        P.post("Triage committed", (text or "")[:400])
-    finally:
-        R.set_snap(state, None)
-
-
-# the kinds of task, tried in order: (does this task belong to the kind, given its spec and whether the task model works
-# alone, the function that runs it). A new kind of task is one more row here
-RUNNERS = [
-    (lambda spec, solo: is_opus_task(spec), do_opus_task),
-    (lambda spec, solo: solo, model_task),
-    (lambda spec, solo: True, worker_task),
-]
-
-
-def do_task(task_id, title, state, solo):
-    """Starts a task from a clean scope and a snapshot, then hands it to the first runner whose kind it is."""
-    spec = W.find_spec(task_id)
-    if not T.clear_leftovers(task_id):
-        P.pause(state, "Driver paused", f"Could not start {task_id}: changes are left over from an earlier run. Look at "
-                "the driver log, then send RESUME.")
+    message = (f"{task_id}: {title}\n\n{(text or '')[:1500]}\n\nCo-Authored-By: {S.WORKER_MODELS['opus']} "
+               "<noreply@anthropic.com>\n")
+    row = f"| {datetime.date.today().isoformat()} | {task_id} | done | - | 1 attempt(s) · {title} · Opus |"
+    paths = sorted(set(W.task_changes(slot.snap(), slot.root)) | set(SL.BOOKKEEPING))
+    failed = land(slot, state, task_id, title, message, paths, row)
+    if failed:
+        held = SL.hold(slot, task_id)
+        T.block(slot, task_id, title, f"its checked work could not land ({failed}). It is kept on branch {held}: "
+                "merge it by hand, then mark the task [x]", "opus_not_landed")
         return
-    snap = WS.snapshot()
-    R.set_snap(state, snap)
-    if snap["dirty"]:
-        R.log(f"already changed before {task_id}, left alone: {', '.join(sorted(snap['dirty'])[:5])}")
-    R.RUNTIME["tests_before"] = W.count_tests()
-    runner = next(run for kind, run in RUNNERS if kind(spec, solo))
-    runner(task_id, title, spec, state)
+    T.announce(state, f"{task_id} {title} (Opus)")
 
 
-def task_crashed(task_id, error, errors_in_a_row, state):
+# the kinds of task, tried in order: (does this spec belong to the kind, the function that runs it). A new kind of task
+# is one more row here
+RUNNERS = [(is_opus_task, do_opus_task), (lambda spec: True, do_worker_task)]
+
+
+def do_task(slot, task_id, title, spec, state):
+    """Starts a task in a clean slot at the main branch's last commit, then hands it to the first runner whose kind it
+    is."""
+    SL.prepare(slot)
+    runner = next(run for kind, run in RUNNERS if kind(spec))
+    runner(slot, task_id, title, spec, state)
+
+
+def task_crashed(slot, task_id, title, error, errors_in_a_row, state):
     """A task raised an error the driver did not expect. Its changes are undone and it is blocked with the error, so the
     loop goes on. If blocking fails too, or MAX_TASK_ERRORS tasks in a row hit an error, the driver pauses."""
     R.log(f"driver error during {task_id}: {error}\n{traceback.format_exc()[-1500:]}")
     if R.RUNTIME.get("stopping"):
         return
     try:
-        T.block(task_id, f"the driver hit an error during the task: {str(error)[:300]}", "driver_error")
+        T.block(slot, task_id, title, f"the driver hit an error during the task: {str(error)[:300]}", "driver_error")
     except Exception as second:
         R.log(f"could not block {task_id} after the error: {second}")
-        P.pause(state, "Driver paused: error", f"{task_id}: {str(error)[:200]}. Blocking it failed too ({second}). "
-                "Look at the driver log, then send RESUME.", "urgent")
+        R.pause(state, "Driver paused: error", f"{task_id}: {str(error)[:200]}. Blocking it failed too ({second}). "
+                "Look at driver.log in the logs folder, then send RESUME.", "urgent")
         return
     if errors_in_a_row >= S.MAX_TASK_ERRORS:
-        P.pause(state, "Driver paused: errors", f"{errors_in_a_row} tasks in a row hit a driver error, the last in "
-                f"{task_id}: {str(error)[:200]}. Look at the driver log, then send RESUME.", "urgent")
+        R.pause(state, "Driver paused: errors", f"{errors_in_a_row} tasks in a row hit a driver error, the last in "
+                f"{task_id}: {str(error)[:200]}. Look at driver.log in the logs folder, then send RESUME.", "urgent")

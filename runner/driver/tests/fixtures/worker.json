@@ -1,0 +1,36 @@
+{
+  "_comment": "The driver tests' project: a Godot game laid out under game/, so every project key is exercised.",
+  "project_root": "project",
+  "scope": [
+    "game/src",
+    "game/tests",
+    "game/content"
+  ],
+  "test_command": [
+    "python",
+    "game/tools/run_tests.py"
+  ],
+  "fail_markers": [
+    "smoke: FAIL"
+  ],
+  "test_files": [
+    "game/tests/**/*.gd"
+  ],
+  "test_function_regex": "^func (test_\\w+)\\(",
+  "any_function_regex": "^(?:static )?func (\\w+)\\(",
+  "assert_regex": "\\b(?:assert_\\w+|fail)\\(",
+  "class_name_regex": "^class_name (\\w+)",
+  "files_prefix": "game/",
+  "files_strip": [
+    "res://"
+  ],
+  "slot_files": {
+    "game/override.cfg": "[application]\n\nconfig/use_custom_user_dir=true\nconfig/custom_user_dir_name=\"game_slot_{slot}\"\n"
+  },
+  "cache_dirs": [
+    "game/.godot"
+  ],
+  "design_file": "loop/DESIGN.md",
+  "topic_file": "no-topic.txt",
+  "token_file": "no-token.txt"
+}
