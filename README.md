@@ -7,6 +7,7 @@ parts that work together, and none of them is tied to one project:
 |---|---|---|
 | Claude Code hook | `hook/` | Sends a phone alert when Claude Code asks for permission, or when a loop ends or needs a decision. |
 | Worker runner | `runner/` | Hands one task at a time to a local model, through Claude Code, and reports its progress, stalls, loops, test results and rule breaks by phone. Answers `STATUS` and `MAN` from the phone while it runs. |
+| Loop driver | `runner/driver/` | Runs a whole task queue in code, one fresh Claude session (or worker run) per task, and commits only what passes its own checks. Answers the phone, restarts itself, and stays within a daily budget. |
 | Loop template | `loop-template/` | The prompt for an orchestrating Claude loop that plans tasks, hands them to the worker, verifies the results and commits. |
 
 It was built for Windows, with Claude Code running in VS Code, a local model served by Ollama, and the orchestrating loop
@@ -96,9 +97,9 @@ The runner gives one task at a time to a local model and watches it. Everything 
      reviewer checks it against.
    - Timers and limits: `max_minutes`, `progress_interval`, `early_progress_interval`, `stuck_check_interval`,
      `loop_idle_minutes`, `max_assists`.
-   - Driver keys, used by `driver.py` (see its section below): `loop_file`, `progress_file`, `open_task_pattern`,
-     `rules_file`, `project_brief`, `sync`, `task_model`, `task_turns`, `task_timeout`, `deny_tools`,
-     `usage_log`, `token_file`.
+   - Driver keys, used by the driver (see its section below): `loop_file`, `progress_file`, `open_task_pattern`,
+     `rules_file`, `project_brief`, `sync`, `task_model`, `task_turns`, `task_timeout`, `test_timeout`,
+     `test_function_regex`, `any_function_regex`, `assert_regex`, `deny_tools`, `usage_log`, `token_file`.
 3. `topic_file` points at the alerts topic file (default `~/.claude/hooks/ntfy-topic.txt`). If it is missing, nothing is sent.
    `inbox_topic_suffix` defaults to an empty string, so alerts and commands use the same topic. Set it to `-inbox` (or
    another suffix) to poll a separate commands topic.
@@ -145,7 +146,7 @@ model server, the model, Claude Code or the task is missing, or if another run i
   error, hand-off error, run not started). `notify_all` sends every alert. All of them are written to `<id>.notify.log`.
 - **Inbox.** When it runs alone, it reads the configured inbox topic every `inbox_poll_interval` seconds. `STATUS` gets an
   immediate progress report, and `MAN` gets the command list. A message is matched after its case and spaces are
-  normalised, so `status` counts, but extra words do not. Other messages are left unread. Under `driver.py` the driver
+  normalised, so `status` counts, but extra words do not. Other messages are left unread. Under the driver it
   answers the inbox instead, and the worker stays quiet on it (`WORKER_UNDER_DRIVER=1`).
 
 ### What lands in the logs folder
@@ -177,76 +178,117 @@ Each point below came from a real failure, and the code handles each one:
 - **The model server is checked before a run starts,** and a missing model is reported by name, not as a confusing failure
   in the middle of the run.
 
-### The driver (`runner/driver.py`)
+### The driver (`runner/driver/`)
 
 The driver runs the open tasks in the task file one at a time, in code, with no orchestrating session. It reads the same
-`worker.json` as the worker, and it imports the worker for the config, the checks and the git helpers. Run it from the
-folder containing `worker.json`, or set `WORKER_CONFIG` to that file.
+`worker.json` as the worker, and it uses the worker's module for the config and the inbox. Run it from the folder
+containing `worker.json`, or set `WORKER_CONFIG` to that file. `<runner>` below is this repo's `runner` folder.
 
 ```
-python driver.py             the supervisor: runs the driver, and starts it again after a crash
-python driver.py --worker    as above, but the worker does each task (worker_task.py) and Haiku reviews it
-python driver.py --run       the driver alone, with no supervisor
-python driver.py --shutdown  stops the supervisor, the driver and its session, from the machine they run on
-python driver.py --model sonnet [high]   who does the tasks from the next one on (the MODEL command)
-python driver.py --approve   approves every call waiting for approval (--deny denies them)
-python check_driver.py       whether the driver runs, its task, its model, approvals, today's spend, the last log lines
-python check_driver.py 20    the same, with the last 20 log lines
-python -m unittest discover -s tests    the driver's own tests
+python <runner>/driver             the supervisor: runs the driver, and starts it again after a crash
+python <runner>/driver --worker    as above, but the worker does each task (worker_task.py) and Haiku reviews it
+python <runner>/driver --run       the driver alone, with no supervisor
+python <runner>/driver --shutdown  stops the supervisor, the driver and its session, from the machine they run on
+python <runner>/driver --model sonnet [high]   who does the tasks from the next one on (the MODEL command)
+python <runner>/driver --approve   approves every call waiting for approval (--deny denies them)
+python <runner>/driver --install-autostart     starts the driver at each logon (Windows Startup folder; elsewhere it
+                                               prints a crontab line), unless you ended it last; --remove-autostart
+python <runner>/driver/check_driver.py [lines] whether it runs, its task, its model, approvals, spend, the last log lines
+python -m unittest discover -s driver/tests    the driver's own tests, from the runner folder
 ```
+
+The folder is a package run through its `__main__.py`, one module per job:
+
+| Module | Job |
+|---|---|
+| `mainloop.py` | the loop, the supervisor, the autostart |
+| `runners.py` | one task: its snapshot, the session or worker run, the gate, then the commit, retry or block; the triage. `RUNNERS` lists the kinds of task, so a new kind is one more row |
+| `commands.py` | the phone's and the machine's commands, approvals, shutdown |
+| `tasks.py` | the task file, the progress file, commits and pushes, undoing a task, the run of blocks |
+| `workspace.py` | the snapshot and every git check the gate makes against it |
+| `sessions.py` | finding Claude Code, sessions, the test run with its timeout, answering the phone meanwhile |
+| `budget.py` | usage limits, the daily budget, each session's cap |
+| `settings.py`, `runtime.py`, `phone.py`, `prompts.py` | the settings block and limits; `driver.json`, the log and pid files; phone messages; every prompt text |
 
 **Who does a task.** One session of `task_model` (default `sonnet`) does each task, with the normal Claude login, the
 tools `Bash, Read, Edit, Write, Glob, Grep`, and the git commands in `deny_tools` refused (read-only git, `git stash list`
 included, is allowed). It has `task_turns` turns, `task_timeout` seconds, and a budget by model ($3 Haiku, $8 Sonnet,
-$20 Opus or Fable). The phone's `MODEL` command changes the model and effort from the next task on, and the choice is
+$30 Opus, $20 Fable). The phone's `MODEL` command changes the model and effort from the next task on, and the choice is
 kept in `driver.json` across restarts. The old config names `haiku_turns`, `haiku_timeout` and `haiku_brief` are still
 read. If a task fails, its changes are undone and `escalate_model` (default `opus`) tries it once more, with the failure
 reason and the test output as feedback. A second failure blocks the task.
 
-**Approvals.** Every automated call to Opus at medium effort or more, and every call to Fable, waits for the phone: an
-**Approve this call?** message (high) with Approve and Deny buttons. The buttons post `APPROVE <code>` or `DENY <code>`
-to the inbox topic; the code is new for each request, so an old button cannot approve a new call. No answer in
-`approval_hours` is a denial. A denied task stays open and the driver pauses; a denied retry blocks the task with the
-first attempt's reason. What asks: the Opus tasks below, every task while `MODEL` is opus (other than effort `low`) or
-fable, and the retry of a failed task when `escalate_model` is opus or fable.
+**Approvals.** With `approvals: on` (the default), every automated call to Opus at medium effort or more, and every call
+to Fable, waits for the phone: an **Approve this call?** message (high) with Approve and Deny buttons. The buttons post
+`APPROVE <code>` or `DENY <code>` to the inbox topic; the code is new for each request, so an old button cannot approve
+a new call. No answer in `approval_hours` is a denial. A denied task stays open and the driver pauses; a denied retry
+blocks the task with the first attempt's reason. What asks: the Opus tasks below, every task while `MODEL` is opus
+(other than effort `low`) or fable, the retry of a failed task when `escalate_model` is opus or fable, and the triage.
+With `approvals: off` nothing asks, and the budgets are the only limit.
 
 **Opus tasks.** A task whose text contains a line `**Who.** Opus ...` runs as an Opus task in either mode, after its
-approval. It uses the `OPUS_MODEL` environment variable (default `opus`), high effort, and a per-task budget and time
-limit. Opus must follow the task's `**Done when.**` line; the driver checks those items and, if code changed, runs the
-same scope and test checks before committing. Give it a `**Done when.**` line with checks in backticks: a `file` path, a
-`test` name or an `output` text. Its output is saved as `<id>.opus.md`.
+approval. It uses the `OPUS_MODEL` environment variable (default `opus`), high effort, a $30 budget and a time limit. Its
+work passes the same gate as any task, with the task and progress files also allowed, and it must have a
+`**Done when.**` line with checks in backticks: a `file` path, a `test` name or an `output` text. Its output is saved as
+`<id>.opus.md`.
 
 Milestone reviews are explicit queue tasks, not automatic triggers at a milestone boundary. Add an Opus task after each
 milestone's implementation tasks (for example, `M2-R`) that follows `loop-template/REVIEW.md`, then an Opus task (for
 example, `M2-N`) that revises the next milestone's tasks against the code and fits in the fix tasks the review wrote.
 
-**Checks before a commit.** The driver does not take a session's word for these:
+**The snapshot.** Each task starts from a snapshot: the commit HEAD points at, and every path already changed. Every
+check, revert and commit works from it, not from HEAD, so:
+- your own uncommitted edits, the loop folder included, are left alone, and never swept into a task's commit;
+- a commit made while a task runs (by hand, or by a session that got round `deny_tools`) pauses the driver with an
+  urgent message, since the task's work may be in that commit, out of the checks' reach. The task stays open. Commit
+  only while the driver is idle or paused.
+
+**Checks before a commit (the gate).** The driver does not take a session's word for these:
 - nothing changed outside `scope` and the loop folder;
-- no test was removed (in worker mode, the worker's count; in the other modes, `test_count_glob` before and after);
-- the test command runs again now, once, and its totals line shows no failures;
+- no file in the loop folder changed that the task's **Files.** or **Done when.** line does not name (Opus tasks may
+  also change the task and progress files), so a session cannot edit the loop file or the task queue;
+- no test was removed: by name (`test_function_regex`), and by count (`test_count_glob`, and the worker's own count);
+- no test function makes fewer asserts than before (`assert_regex`, with `any_function_regex` marking where a test
+  ends), unless the task names that function or its file: a task may rewrite the asserts it names, but no other test
+  may be loosened to pass;
+- the test command runs again now, once, within `test_timeout` seconds, and its totals line shows no failures. A run
+  that hangs is killed with everything it started, and counts as failed;
 - the task's `**Done when.**` line holds, when it has one (Opus tasks must have one). A `test` item is a function of that
   name in any file under the scope.
 
+The three regexes default to Python, GDScript, JavaScript and Rust style (`def`, `func`, `function`, `fn`; `assert...`,
+`expect(`, `fail(`). Set them in `worker.json` for another language.
+
 A task that fails a check, or ends in a failing state, is reverted with a backup and marked `[!]`, and the reason goes in
-the progress file's Blocked section. Files it wrote outside the scope are undone too, and the folders that leaves empty
-are removed. In `--worker` mode a state listed in `retry_states` is first retried with the test output, up to
-`max_attempts`. A blocked task is not sent to the phone: the driver moves on, and the commit says why.
+the progress file's Blocked section. In `--worker` mode a state listed in `retry_states` is first retried with the test
+output, up to `max_attempts`. A blocked task is not sent to the phone: the driver moves on, and the commit says why.
 
-**Crashes.** The supervisor starts the driver again after a crash: 1 minute after the first, doubling each time, and it
-gives up (urgent message) after 5 crashes that each came within 10 minutes of a start. A task that raises an error the
-driver did not expect is blocked with the error and the loop goes on; 3 such tasks in a row pause it. A clean end
-(`WIND DOWN`, `SHUTDOWN NOW`, `--shutdown`) ends the supervisor too.
+**A run of blocks.** Two tasks blocked in a row usually share a cause, such as a test that pins a number their specs
+change. The driver then queues a **triage**: one Opus session ($10) reads the blocked tasks' logs, finds the shared
+cause, and fixes it or rewrites the tasks, re-opening the ones it fixed. Its work passes the same gate and is committed,
+or undone. If two more tasks are blocked after a triage, the driver pauses (urgent) instead of paying for more failures.
+A commit ends the run.
 
-**Spending.** Every session writes a line to `usage.jsonl`. When a day's recorded spending reaches `daily_budget_usd`,
-the driver pauses until just after midnight and sends an urgent message. If a session hits a Claude usage limit, the
-driver leaves the task open, sends an urgent message, and resumes four minutes after the limit resets (or waits for
-`RESUME` when no reset time is given).
+**Crashes and restarts.** The supervisor starts the driver again after a crash: 1 minute after the first, doubling each
+time. After 5 crashes that each came within 10 minutes of a start, it sends an urgent message, rests 2 hours, and tries
+again. A task that raises an error the driver did not expect is blocked with the error and the loop goes on; 3 such tasks
+in a row pause it. A clean end (`WIND DOWN`, `SHUTDOWN NOW`, `--shutdown`) ends the supervisor too, and marks the driver
+as ended by you, so `--autostart` at the next logon leaves it stopped. After a reboot or a crash it starts again.
 
-**Before a task starts** the scope must be clean. Leftover changes in the scope are saved and reverted. Changes outside
-the scope and the loop folder are never undone before a task: it pauses and says so, so you can look first.
+**Finding Claude Code.** A `claude_exe` that names a path is used as it is. The default `claude` is looked up on PATH,
+and then in the newest VS Code extension folder, so an extension update does not break the driver.
 
-**Commit and sync.** After a pass, the driver commits the scope, the files the Done when line names, the task file and
-the progress file, with a `Co-Authored-By` line for the model that wrote it. If `sync` is true (the default is false) it
+**Spending.** Every session writes a line to `usage.jsonl`. No session may spend more than what is left of today's
+`daily_budget_usd`; one that stops at that cut leaves its task open and pauses the driver until just after midnight,
+instead of counting as a failure. When a day's recorded spending reaches the budget, the driver pauses until midnight
+and sends an urgent message. If a session hits a Claude usage limit, the driver leaves the task open, sends an urgent
+message, and resumes four minutes after the limit resets (or waits for `RESUME` when no reset time is given).
+
+**Before a task starts** the scope must be clean: leftover changes in the scope are saved and undone. Changes outside
+the scope become part of the snapshot and are left alone.
+
+**Commit and sync.** After a pass, the driver commits the scope, the loop files the task names, the task file and the
+progress file, with a `Co-Authored-By` line for the model that wrote it. If `sync` is true (the default is false) it
 then runs `git push origin HEAD`. It never forces a push. If the push fails, the commit stays local and the phone gets a
 "Sync failed" message.
 
@@ -260,9 +302,11 @@ retry_states: tests_failed, failed, looped, timed_out, tests_did_not_run
 escalate_model: opus
 daily_budget_usd: 120
 approval_hours: 12
+approvals: on
 ```
 
-`escalate_model: none` turns the retry off, and `daily_budget_usd: 0` turns the budget off.
+`escalate_model: none` turns the retry off, `daily_budget_usd: 0` turns the budget off, and `approvals: off` lets every
+automated call run without asking the phone.
 
 **Phone messages.** The driver sends these whatever `phone_titles` says:
 
@@ -272,8 +316,11 @@ approval_hours: 12
 | Approve this call? | an automated Opus or Fable call waits for you (high, with buttons) |
 | Loop paused: not approved | a call was denied, or not answered in time |
 | Loop finished | no open task is left; send RESUME after you add some |
-| Driver paused | a task could not start because of changes left from an earlier run |
-| Loop paused: daily budget reached | today's spending reached `daily_budget_usd` (urgent) |
+| Driver paused | a task could not start because its scope could not be cleaned |
+| Driver paused: a commit was made during a task | HEAD moved while a task ran (urgent) |
+| Triage queued, Triage committed, Triage: no change, Triage undone | a run of blocks, and what the triage did |
+| Driver paused: tasks keep failing | more blocks after a triage (urgent) |
+| Loop paused: daily budget reached, Loop paused: daily budget | today's spending reached `daily_budget_usd`, or cut a session short |
 | Loop stopped: session usage exhausted | a Claude usage limit (urgent) |
 | Sync failed | the push was rejected or timed out |
 | Loop status, Commands, Loop task model, Approval | the answers to STATUS, MAN, MODEL and APPROVE or DENY |
@@ -281,7 +328,7 @@ approval_hours: 12
 | Loop will exit, Loop exited | WIND DOWN |
 | Loop shutting down | SHUTDOWN NOW |
 | Loop driver crashed | the driver stopped on an error (urgent); the supervisor restarts it |
-| Loop driver down | the supervisor gave up after 5 quick crashes (urgent) |
+| Loop driver down | 5 quick crashes; the supervisor rests 2 hours, then tries again (urgent) |
 | Driver paused: error, Driver paused: errors | a task error could not be blocked, or 3 came in a row (urgent) |
 
 **Phone commands.** Each message is matched after its case and spaces are normalised.
@@ -292,34 +339,66 @@ approval_hours: 12
 | `MAN` | the command list |
 | `STOP` or `PAUSE` | no new task starts until RESUME; the driver stays up |
 | `RESUME` or `RESTART` | carry on |
-| `WIND DOWN` | the driver ends after the current step |
+| `WIND DOWN` | the driver ends once the current task is committed or undone (a running session is not cut short) |
 | `SHUTDOWN NOW` | kills the running session at once, undoes the unfinished task, and ends the driver |
 | `APPROVE <code>` or `DENY <code>` | the answer to an approval request |
 | `MODEL` | reports who does the tasks; `MODEL <model> [effort]` changes it (haiku, sonnet, opus or fable) |
 | `EFFORT <level>` | changes only the effort: low, medium, high, xhigh, max or default |
 
-The commands are read every `poll_seconds`, including during a session, where a thread reads them, and every 15 seconds
-while an approval waits. A message that is not a command is ignored. A short one is also logged in `driver.log`, in case
-it was a typo.
+The commands are read every `poll_seconds`, including during a session, a worker run or a test run, where a thread
+reads them, and every 15 seconds while an approval waits. A message that is not a command is ignored. A short one is
+also logged in `driver.log`, in case it was a typo.
 
 **Files** in `logs_dir`: `driver.log` (what the driver did, in order; one file a day, the older ones named
-`driver-<date>.log`), `driver.json` (paused, busy, the current task, the task model, waiting approvals, heartbeat and any
-scheduled restart; written whole each time), `driver.pid` and `driver-supervisor.pid`, `driver-request.txt` (commands
-from `--model`, `--approve` and `--deny` until the driver reads them), `<id>.task.jsonl` and `<id>.<model>.md` (a task
-session's stream and final message), `<id>.opus.jsonl` and `<id>.opus.md` (an Opus task's), `<id>.feedback.txt` (the
-test output for a worker retry), `usage.jsonl` (one line per session), and `revert-<time>/` (what was undone).
+`driver-<date>.log`), `driver.json` (paused, busy, the current task and its snapshot, the task model, waiting
+approvals, the run of blocks, heartbeat and any scheduled restart; written whole each time), `driver.pid` and
+`driver-supervisor.pid`, `driver-request.txt` (commands from `--model`, `--approve` and `--deny` until the driver reads
+them), `<id>.task.jsonl` and `<id>.<model>.md` (a task session's stream and final message), `<id>.opus.jsonl` and
+`<id>.opus.md` (an Opus task's), `triage-<time>.triage.jsonl` (a triage's), `<id>.feedback.txt` (the test output for a
+worker retry), `usage.jsonl` (one line per session), and `revert-<time>/` (what was undone).
 
 **One driver per folder.** A second start refuses while the first one or its supervisor is still running.
 
 **Limits.** The driver does not handle `ANSWER`, `APPROVED` or `REJECTED`, or the orchestrator's `[?]` tasks. Tasks done
-by one model session are not peer-reviewed, so the driver's checks above are their gate.
+by one model session are not peer-reviewed, so the gate above is their review.
+
+## Driver or orchestrator?
+
+There are two ways to run a task queue with this folder:
+
+- **The driver** is a Python program. It starts one fresh Claude session per task and checks the result itself.
+- **An orchestrator** is one long Claude session following `loop-template/LOOP.md`. It reads the queue, hands tasks
+  out, judges the results and decides what to do next.
+
+| | Driver | Orchestrator |
+|---|---|---|
+| **The checks before a commit** | Code, run the same way every time. A session cannot talk its way past them. | The model's judgement, which can drift, or be persuaded by its own earlier output. |
+| **Cost between tasks** | None. Only the task sessions spend. | Every bookkeeping turn spends, and the context grows until it has to be compacted. |
+| **Context** | Each task starts fresh, with only the rules and its own spec. | Earlier tasks' details, and their mistakes, carry forward. Compaction can drop a rule. |
+| **When a session fails** | The task is undone and retried or blocked, and the next task starts. A supervisor restarts the driver itself. | The loop stops until someone restarts the session. |
+| **Running unattended** | Answers the phone, restarts at logon, resumes after usage limits and the daily budget. | Needs a terminal kept open, and can stall on a permission prompt. |
+| **Judgement between tasks** | Only what the code knows. An Opus task, or the triage after a run of blocks, adds judgement where it is needed. | It can spot a wrong spec before running it, reorder tasks, fix a broken test in passing, or stop and ask. |
+| **Something unexpected** | It has code for the case, or the task is blocked. | It can reason about a case nobody planned for. |
+| **Changing how it works** | A code change, with tests. | A prompt edit. |
+| **What it handles** | Open tasks with a Done when line, `**Who.** Opus` tasks, and the phone commands above. | Everything the template has, `ANSWER`, `APPROVED`, `REJECTED` and `[?]` tasks included. |
+| **Predictability** | Behaviour is code, with unit tests. | Behaviour shifts with the model, the prompt and the run. |
+
+**Use the driver** when the tasks are well specified: worked examples, a **Files.** line and a **Done when.** line. Then
+judgement between tasks adds little, and a gate that cannot be skipped catches what actually goes wrong: tests pinned to
+a number the task changes, edits outside the scope, tests loosened to pass. Put the parts that need judgement into the
+queue as Opus tasks, such as milestone reviews and task revisions. Then the queue gets judgement where it needs it, and
+stays mechanical everywhere else.
+
+**Use an orchestrator** when every step needs judgement. That covers writing a new milestone's tasks before their specs
+are settled, debugging the loop itself, and any queue that uses the template's `ANSWER`/`APPROVED`/`REJECTED`
+conversation with you.
 
 ## The loop template (`loop-template/LOOP.md`)
 
 The template is the prompt for an orchestrating Claude loop that works through a task queue. The loop plans and verifies;
 the worker writes the code. The template uses only the config's names, so it works with any `worker.json`.
 
-`driver.py` runs the same steps in code. You need an orchestrating session only for the `ANSWER`, `APPROVED`, `REJECTED`
+The driver (`runner/driver/`) runs the same steps in code. See **Driver or orchestrator?** above for which to use. You need an orchestrating session only for the `ANSWER`, `APPROVED`, `REJECTED`
 and `[?]` parts of the template. The template's driver section says which steps the driver follows.
 
 Its steps, per iteration:
@@ -352,8 +431,11 @@ the `<runner>` placeholder is the folder that holds `worker_task.py`.
 - **ntfy.sh is a third party.** Alert text, up to 500 characters, passes through it. Keep secrets out of alerts. The hook
   sends the last assistant message, so loops should not print secrets. Self-host ntfy with access control if alerts may
   carry sensitive detail.
-- **Task sessions can run shell commands too.** `driver.py` gives each task session Bash. Its `deny_tools` list is
-  the guard against git commands that change files or the index, because the driver does the commits.
+- **Task sessions can run shell commands too.** The driver gives each task session Bash. Its `deny_tools` list is
+  the guard against git commands that change files or the index, because the driver does the commits. A prefix list
+  can be got round (`bash -c "git commit ..."`), so the driver also pauses if a commit appears during a task, and
+  undoes changes to the loop folder that the task does not name. It does not sandbox the shell: a session can still
+  read or change files outside the repository.
 - **The worker can run shell commands.** With the default `allowed_tools`, the worker can run any Bash command in the
   session. The limits are the scope check, the tool list and the test rules, not a command list. Narrow `allowed_tools`
   in the config if you want a tighter gate; a blocked command then shows up as an approval alert.
@@ -371,9 +453,11 @@ the `<runner>` placeholder is the folder that holds `worker_task.py`.
 | "approval" alert | A tool call was blocked, usually a command outside `allowed_tools` | Widen `allowed_tools`, or change the prompt to use an allowed command. |
 | Run stops with `looped` | The helper's advice did not help twice | Read `<id>.helper-<n>.md`, improve the task text, and retry with feedback. |
 | Inbox message never handled | The loop is not running, or the message is not one of the commands | Check the progress file for the "ignored inbox message" note. |
-| "a driver is already running" | A driver from this folder is alive, or `driver.pid` is stale | Send `SHUTDOWN NOW`, or `python driver.py --shutdown`. If the pid in `driver.pid` is not a driver, delete the file. |
-| Driver appears stuck or you need its current state | Check the driver's process and recent log output | Run `python check_driver.py` (or `python check_driver.py 20` for more log lines). |
-| "Driver paused: ... changes are left over" | Uncommitted changes outside the scope, which the driver never undoes | Commit or revert them, then send RESUME. |
+| "a driver is already running" | A driver from this folder is alive, or `driver.pid` is stale | Send `SHUTDOWN NOW`, or `python <runner>/driver --shutdown`. If the pid in `driver.pid` is not a driver, delete the file. |
+| Driver appears stuck or you need its current state | Check the driver's process and recent log output | Run `python <runner>/driver/check_driver.py` (or add `20` for more log lines). |
+| "Driver paused: a commit was made during a task" | A commit landed while a task ran | Look at `git log`, then send RESUME. The task starts again; its leftovers in the scope are saved and undone first. |
+| "Driver paused: tasks keep failing" | Tasks keep being blocked, even after a triage | Read the Blocked lines in the progress file and the triage's log, fix the shared cause, then send RESUME. |
+| "Driver paused: ... changes are left over" | Changes in the scope could not be undone (a locked file, for example) | Look at the driver log, clear them by hand, then send RESUME. |
 | "Sync failed" | The push was rejected (for example, the remote moved on) or timed out | Fix the remote and push by hand. The commit is already local, and the driver never forces a push. |
 | "Loop stopped: session usage exhausted" | The Claude usage limit was reached during a Haiku or Opus task | Wait for the scheduled restart, or send RESUME once usage is available. If no restart time is shown, send RESUME manually. |
 | Phone gets no alert from the worker | The title is not in `phone_titles` | Add it to `phone_titles`, or set `notify_all`. The alert is still in `<id>.notify.log`. |
@@ -396,7 +480,9 @@ Two bugs found while building this, so they are not reintroduced:
 - [ ] `worker_task.py --status` runs with a valid config and prints JSON or "no hand-off has run yet".
 - [ ] A first attempt refuses to start while a leftover change exists in the scope paths.
 - [ ] A run with a fake worker sends the start and finish messages and writes the readable log.
-- [ ] `driver.py` with a task that changes a file outside the scope commits nothing, reverts the change, and marks the task `[!]`.
-- [ ] `driver.py` answers `STATUS` and `MAN` with a phone message, and a long message that is not a command is ignored.
-- [ ] `driver.py` with `SHUTDOWN NOW` during a Haiku session kills the session, leaves the task open, and exits.
+- [ ] The driver, with a task that changes a file outside the scope, commits nothing, reverts the change, and marks the task `[!]`.
+- [ ] The driver answers `STATUS` and `MAN` with a phone message, and a long message that is not a command is ignored.
+- [ ] The driver, with `SHUTDOWN NOW` during a task session, kills the session, leaves the task open, and exits.
+- [ ] The driver, with a commit made by hand during a task, pauses and leaves the task open.
+- [ ] `python <runner>/driver --install-autostart`, then a logon, starts the driver; after `WIND DOWN` it does not.
 - [ ] A worker alert whose title is not in `phone_titles` does not reach the phone.

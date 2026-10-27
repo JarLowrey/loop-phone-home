@@ -9,14 +9,14 @@ task's code yourself. If the worker fails a task, that is the result, not a reas
 
 ## Driver
 
-`python <runner>/driver.py` runs this loop without an orchestrating session. It does the steps below in code, and it
+`python <runner>/driver` runs this loop without an orchestrating session. It does the steps below in code, and it
 reads the settings block that follows. It does not do the `ANSWER`, `APPROVED` or `REJECTED` commands, or the `[?]`
-tasks: those need an orchestrating session. `python <runner>/driver.py --shutdown` stops a running driver from the
+tasks: those need an orchestrating session. `python <runner>/driver --shutdown` stops a running driver from the
 machine. The README lists every phone command the driver answers.
 
 ## Driver settings
 
-If `driver.py` runs the loop, it reads this block. Each value is read again at each pass, so an edit takes effect
+If the driver runs the loop, it reads this block. Each value is read again at each pass, so an edit takes effect
 without a restart.
 
 ```driver-settings
@@ -26,15 +26,18 @@ retry_states: tests_failed, failed, looped, timed_out, tests_did_not_run
 escalate_model: opus
 daily_budget_usd: 120
 approval_hours: 12
+approvals: on
 ```
 
 - `poll_seconds`: how often the driver answers the phone while it waits (5 at least).
 - `max_attempts`: attempts for a task in `--worker` mode, counting the first. A state in `retry_states` is retried with
   the test output; any other state blocks the task.
 - `escalate_model`: in the default mode one session of `task_model` does each task; a failed task is undone and this
-  model tries it once more (`none` turns that off). An Opus or Fable retry asks the phone first.
+  model tries it once more (`none` turns that off). With approvals on, an Opus or Fable retry asks the phone first.
 - `daily_budget_usd`: the driver pauses until midnight once a day's recorded spending reaches it (0 turns it off).
 - `approval_hours`: how long an approval request waits before it counts as a denial.
+- `approvals`: `on` makes automated Opus (medium effort or more) and Fable calls wait for the phone's Approve; `off`
+  lets them run within their budgets.
 
 ## Milestone reviews with Opus
 
@@ -47,7 +50,7 @@ milestone and before the next milestone's implementation tasks:
 2. `M<n>-N`: Opus revises the next milestone's task descriptions to match the code and review, fits in the fix tasks
    the review wrote, then writes a short report of the task changes.
 
-Mark each entry with `**Who.** Opus` so `driver.py` runs it with Opus rather than the task model or the worker.
+Mark each entry with `**Who.** Opus` so the driver runs it with Opus rather than the task model or the worker.
 The driver asks the phone to approve each one before it starts. Give each task a
 `**Done when.**` line with verifiable `file`, `test` or `output` items in backticks. List all files it may change in
 the task. The driver checks the task's Done when items, scope and tests before committing; a failed check reverts and
@@ -82,7 +85,7 @@ blocks the task. Without these queue entries, no milestone review or next-milest
    `curl -s -H "Title: Unknown command" -d "'<text>' is not a command. Send MAN for the list." "https://ntfy.sh/${TOPIC}"`.
    Longer text is skipped without a note: on a shared topic, those are the hand-off script's and the hook's own alerts.
 
-   The command list for `MAN`. `driver.py` sends its own list, which has `WIND DOWN`, `SHUTDOWN NOW` and `RESTART` instead
+   The command list for `MAN`. The driver sends its own list, which has `WIND DOWN`, `SHUTDOWN NOW` and `RESTART` instead
    of `ANSWER`, `APPROVED` and `REJECTED`:
    ```
    Commands (exact text, any case; ANSWER accepts text after its exact prefix):
@@ -159,7 +162,7 @@ the two loop files.
 ## Rules
 - One task at a time, in order. Don't start a task until the one before it is committed. A `[?]` task counts as
   finished for this rule: the loop moves on while it waits for you.
-- Never delete, skip or loosen an existing test. Never `git push` by hand: `driver.py` pushes after each commit it makes
+- Never delete, skip or loosen an existing test. Never `git push` by hand: the driver pushes after each commit it makes
   when `sync` is set in `worker.json`, and an orchestrator never pushes.
 - Don't change design numbers. A number the worker had to pick goes under "Open questions" in the progress file.
 - Phase 2 tasks start only after every Phase 1 task is `[x]`, `[!]` or `[?]`.

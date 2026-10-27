@@ -57,5 +57,9 @@
   "sync": false,
   "task_model": "sonnet",
   "task_turns": 40,
-  "task_timeout": 1800
+  "task_timeout": 1800,
+  "test_timeout": 1800,
+  "test_function_regex": "^\\s*(?:async\\s+)?(?:static\\s+)?(?:def|func|function|fn)\\s+(test_?\\w+)\\s*\\(",
+  "any_function_regex": "^\\s*(?:async\\s+)?(?:static\\s+)?(?:def|func|function|fn)\\s+(\\w+)\\s*\\(",
+  "assert_regex": "\\bassert\\w*\\b|\\bexpect\\s*\\(|\\bfail\\s*\\("
 }

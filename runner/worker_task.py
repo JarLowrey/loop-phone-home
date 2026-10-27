@@ -35,7 +35,7 @@ Logs, in <logs_dir>:
 
 Phone messages go to the topic named in topic_file. Nothing is sent if that file is missing. Alerts reach the phone only
 when their title is in phone_titles. While a run is going, the inbox commands STATUS and MAN (any case) are answered,
-unless WORKER_UNDER_DRIVER=1 is set: driver.py sets it, and answers every command itself.
+unless WORKER_UNDER_DRIVER=1 is set: the driver (driver/) sets it, and answers every command itself.
 
 Environment overrides: WORKER_CONFIG (config path), WORKER_MODEL (worker model), CLAUDE_EXE (Claude Code path),
 WORKER_NOTIFY_DRY=1 (print messages instead of sending), and for testing this script: WORKER_FINAL_TESTS=0 (skip its
@@ -109,7 +109,7 @@ DEFAULTS = {
                      "Worker run not started"],
     "notify_all": False,
     "usage_log": "usage.jsonl",            # one line per worker session and per helper call, in logs_dir
-    # the driver (driver.py) reads these
+    # the driver (driver/) reads these
     "loop_file": "loop/LOOP.md",           # holds the driver-settings block
     "progress_file": "loop/PROGRESS.md",   # the log: a table row per task, and a Blocked section
     "open_task_pattern": r"^### \[ \] (\S+) (.*)$",   # two groups: the id and the title of the first open task
@@ -119,6 +119,11 @@ DEFAULTS = {
     "task_model": "sonnet",                # the model that does each task (haiku, sonnet, opus or fable); MODEL changes it
     "task_turns": 40,                      # turns for one task session
     "task_timeout": 1800,                  # seconds for one task session
+    "test_timeout": 1800,                  # seconds the driver's own test run may take before it counts as failed
+    # the driver's gate: a test function (group 1 is its name), any function (where a test ends), and one assert
+    "test_function_regex": r"^\s*(?:async\s+)?(?:static\s+)?(?:def|func|function|fn)\s+(test_?\w+)\s*\(",
+    "any_function_regex": r"^\s*(?:async\s+)?(?:static\s+)?(?:def|func|function|fn)\s+(\w+)\s*\(",
+    "assert_regex": r"\bassert\w*\b|\bexpect\s*\(|\bfail\s*\(",
 }
 # the old names of keys, still read when a config uses them
 RENAMED = {"haiku_brief": "project_brief", "haiku_turns": "task_turns", "haiku_timeout": "task_timeout"}
@@ -163,7 +168,7 @@ What the worker has changed so far (git diff of the scope paths; new untracked f
 The worker's last actions (time, source, text):
 {recent}
 """
-# The answer to MAN when the worker runs on its own. Under driver.py, the driver's own list is sent instead.
+# The answer to MAN when the worker runs on its own. Under the driver, its own list is sent instead.
 COMMANDS_HELP = """Commands (any case, the whole message):
 STATUS - progress report now
 MAN - this list"""
