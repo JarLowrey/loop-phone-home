@@ -503,8 +503,14 @@ def haiku_stream(prompt, task_id, model=None, turns=None, timeout=None, extra=()
             except ValueError:
                 log(f"haiku output: {line.rstrip()[:200]}")
                 continue
-            content = event.get("message", {}).get("content")
+            if not isinstance(event, dict):
+                continue
+            message = event.get("message")
+            # why: a system event (such as permission_denied) carries its message as a plain string
+            content = message.get("content") if isinstance(message, dict) else None
             parts = content if isinstance(content, list) else []
+            if event.get("type") == "system" and isinstance(message, str):
+                log(f"haiku {event.get('subtype', 'system')}: {message[:200]}")
             if event.get("type") == "assistant":
                 for part in parts:
                     if part.get("type") == "text" and part.get("text", "").strip():
