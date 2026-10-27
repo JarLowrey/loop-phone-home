@@ -1,0 +1,12 @@
+{"type":"system","subtype":"init","session_id":"s","tools":["Bash","Read"],"model":"claude-sonnet-5-5"}
+{"type":"assistant","message":{"model":"claude-sonnet-5-5","id":"msg_1","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"x"}]}}
+{"type":"assistant","message":{"model":"claude-sonnet-5-5","id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Reading the task first."}]}}
+{"type":"assistant","message":{"model":"claude-sonnet-5-5","id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"wc -l src/app.py; git stash list"}}]}}
+{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"toolu_1","decision_reason_type":"subcommandResults","message":"Permission to use Bash with command wc -l; git stash list has been denied.","uuid":"u","session_id":"s"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"Permission denied\nline two","is_error":true}]}}
+{"type":"user","message":"a bare string message"}
+{"type":"assistant","message":{"content":"not a list"}}
+{"type":"assistant","message":{"content":["not a dict", {"type":"text","text":"  "}]}}
+"a bare JSON string"
+[1, 2, 3]
+{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"Changed: a.gd. 10 passed, 0 failed","total_cost_usd":0.01}

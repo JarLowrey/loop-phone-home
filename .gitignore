@@ -1,7 +1,7 @@
 # local settings and runtime files: never commit
 runner/worker.json
 runner/*.tmp
-runner/__pycache__/
+__pycache__/
 hook/ntfy-topic.txt
 loop/logs/
 loop/inbox-seen.txt

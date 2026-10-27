@@ -63,6 +63,7 @@ DEFAULTS = {
     "inbox_seen_file": "loop/inbox-seen.txt",
     # phone
     "topic_file": "~/.claude/hooks/ntfy-topic.txt",   # holds the topic used for alerts
+    "token_file": "~/.claude/hooks/ntfy-token.txt",   # optional: an ntfy access token, sent on every call when present
     "inbox_topic_suffix": "",                         # empty uses the same topic; "-inbox" separates commands
     "ntfy_server": "https://ntfy.sh",
     # what the worker may change, and how to test it
@@ -96,8 +97,11 @@ DEFAULTS = {
     "loop_idle_minutes": 15,
     "gpu_busy_percent": 20,
     "inbox_poll_interval": 60,
-    # git commands a worker session may not run: they change files or the index
-    "deny_tools": ["Bash(git restore:*)", "Bash(git checkout:*)", "Bash(git reset:*)", "Bash(git stash:*)",
+    # git commands a session may not run: they change files or the index. Read-only git, git stash list included, is
+    # allowed
+    "deny_tools": ["Bash(git restore:*)", "Bash(git checkout:*)", "Bash(git reset:*)", "Bash(git stash)",
+                   "Bash(git stash push:*)", "Bash(git stash save:*)", "Bash(git stash pop:*)",
+                   "Bash(git stash apply:*)", "Bash(git stash drop:*)", "Bash(git stash clear:*)",
                    "Bash(git clean:*)", "Bash(git rm:*)", "Bash(git mv:*)", "Bash(git switch:*)",
                    "Bash(git add:*)", "Bash(git commit:*)"],
     # the only alerts that reach the phone; notify_all sends every alert
@@ -109,12 +113,15 @@ DEFAULTS = {
     "loop_file": "loop/LOOP.md",           # holds the driver-settings block
     "progress_file": "loop/PROGRESS.md",   # the log: a table row per task, and a Blocked section
     "open_task_pattern": r"^### \[ \] (\S+) (.*)$",   # two groups: the id and the title of the first open task
-    "rules_file": "CLAUDE.md",             # the project rules, given to the driver's Haiku session
-    "haiku_brief": "a software project",  # one line about the project, for Haiku's prompt
+    "rules_file": "CLAUDE.md",             # the project rules, given to the driver's task sessions
+    "project_brief": "a software project",  # one line about the project, for the task session's prompt
     "sync": False,                         # the driver pushes the branch after each commit it makes: set true to push
-    "haiku_turns": 40,
-    "haiku_timeout": 1800,
+    "task_model": "sonnet",                # the model that does each task (haiku, sonnet, opus or fable); MODEL changes it
+    "task_turns": 40,                      # turns for one task session
+    "task_timeout": 1800,                  # seconds for one task session
 }
+# the old names of keys, still read when a config uses them
+RENAMED = {"haiku_brief": "project_brief", "haiku_turns": "task_turns", "haiku_timeout": "task_timeout"}
 REQUIRED = ("scope", "test_command", "worker_model")
 
 LOOP_REPEAT = 3
@@ -173,7 +180,11 @@ def configure():
     if not path.exists():
         sys.exit(f"no config file at {path}. Copy worker.example.json there, or set WORKER_CONFIG.")
     settings = dict(DEFAULTS)
-    settings.update(json.loads(path.read_text(encoding="utf-8")))
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    for old, new in RENAMED.items():
+        if old in loaded and new not in loaded:
+            loaded[new] = loaded.pop(old)
+    settings.update(loaded)
     if os.environ.get("WORKER_MODEL"):
         settings["worker_model"] = os.environ["WORKER_MODEL"]
     if os.environ.get("CLAUDE_EXE"):
@@ -207,6 +218,16 @@ def configure():
     if not isinstance(C.inbox_topic_suffix, str):
         sys.exit(f"config {path}: inbox_topic_suffix must be a string")
     C.inbox_topic = C.topic + C.inbox_topic_suffix
+    token_path = resolve(settings["token_file"])
+    C.token = "".join(token_path.read_text(encoding="utf-8").split()) if token_path.exists() else ""
+
+
+def ntfy_headers(headers=None):
+    """The headers of a call to ntfy, with the access token when token_file holds one."""
+    headers = dict(headers or {})
+    if C.token:
+        headers["Authorization"] = f"Bearer {C.token}"
+    return headers
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -225,7 +246,7 @@ def notify(log_path, title, body, priority="default", force=False):
     if not C.topic or (not force and not C.notify_all and title not in C.phone_titles):
         return
     request = urllib.request.Request(f"{C.ntfy_server}/{C.topic}", data=body[:500].encode("utf-8"),
-                                     headers={"Title": title, "Priority": priority}, method="POST")
+                                     headers=ntfy_headers({"Title": title, "Priority": priority}), method="POST")
     try:
         urllib.request.urlopen(request, timeout=20).read()
     except Exception:
@@ -237,9 +258,9 @@ def poll_inbox():
     if not C.inbox_topic:
         return []
     try:
-        body = urllib.request.urlopen(
-            f"{C.ntfy_server}/{C.inbox_topic}/json?poll=1&since=10m", timeout=20
-        ).read()
+        request = urllib.request.Request(f"{C.ntfy_server}/{C.inbox_topic}/json?poll=1&since=10m",
+                                         headers=ntfy_headers())
+        body = urllib.request.urlopen(request, timeout=20).read()
     except Exception:
         return []
     messages = []

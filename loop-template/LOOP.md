@@ -23,24 +23,32 @@ without a restart.
 poll_seconds: 60
 max_attempts: 3
 retry_states: tests_failed, failed, looped, timed_out, tests_did_not_run
+escalate_model: opus
+daily_budget_usd: 120
+approval_hours: 12
 ```
 
 - `poll_seconds`: how often the driver answers the phone while it waits (5 at least).
 - `max_attempts`: attempts for a task in `--worker` mode, counting the first. A state in `retry_states` is retried with
-  the test output; any other state blocks the task. The default Haiku-alone mode runs one session per task and blocks
-  a failed one at once.
+  the test output; any other state blocks the task.
+- `escalate_model`: in the default mode one session of `task_model` does each task; a failed task is undone and this
+  model tries it once more (`none` turns that off). An Opus or Fable retry asks the phone first.
+- `daily_budget_usd`: the driver pauses until midnight once a day's recorded spending reaches it (0 turns it off).
+- `approval_hours`: how long an approval request waits before it counts as a denial.
 
 ## Milestone reviews with Opus
 
 The driver does not infer milestone boundaries. When planning the task queue, put two explicit Opus tasks after each
 milestone and before the next milestone's implementation tasks:
 
-1. `M<n>-R`: Opus reviews the completed milestone against the design and later milestones, fixes issues it finds, and
-   writes a review report.
-2. `M<n>-N`: Opus revises the next milestone's task descriptions to match the code and review, then writes a short
-   report of the task changes.
+1. `M<n>-R`: Opus reviews the completed milestone by following `REVIEW.md` (copy it next to this file): eight questions
+   answered with evidence. Each finding is fixed in the review, or written as a fix task (`M<n+1>-F1`, ...) at the
+   start of the next milestone. It writes a review report.
+2. `M<n>-N`: Opus revises the next milestone's task descriptions to match the code and review, fits in the fix tasks
+   the review wrote, then writes a short report of the task changes.
 
-Mark each entry with `**Who.** Opus` so `driver.py` runs it with Opus rather than Haiku or the worker. Give each task a
+Mark each entry with `**Who.** Opus` so `driver.py` runs it with Opus rather than the task model or the worker.
+The driver asks the phone to approve each one before it starts. Give each task a
 `**Done when.**` line with verifiable `file`, `test` or `output` items in backticks. List all files it may change in
 the task. The driver checks the task's Done when items, scope and tests before committing; a failed check reverts and
 blocks the task. Without these queue entries, no milestone review or next-milestone revision runs automatically.

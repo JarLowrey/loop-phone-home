@@ -5,6 +5,7 @@
   "logs_dir": "loop/logs",
   "inbox_seen_file": "loop/inbox-seen.txt",
   "topic_file": "~/.claude/hooks/ntfy-topic.txt",
+  "token_file": "~/.claude/hooks/ntfy-token.txt",
   "inbox_topic_suffix": "",
   "scope": [
     "src/",
@@ -37,7 +38,9 @@
     "docs/DESIGN.md"
   ],
   "deny_tools": [
-    "Bash(git restore:*)", "Bash(git checkout:*)", "Bash(git reset:*)", "Bash(git stash:*)",
+    "Bash(git restore:*)", "Bash(git checkout:*)", "Bash(git reset:*)", "Bash(git stash)",
+    "Bash(git stash push:*)", "Bash(git stash save:*)", "Bash(git stash pop:*)",
+    "Bash(git stash apply:*)", "Bash(git stash drop:*)", "Bash(git stash clear:*)",
     "Bash(git clean:*)", "Bash(git rm:*)", "Bash(git mv:*)", "Bash(git switch:*)",
     "Bash(git add:*)", "Bash(git commit:*)"
   ],
@@ -50,8 +53,9 @@
   "progress_file": "loop/PROGRESS.md",
   "open_task_pattern": "^### \\[ \\] (\\S+) (.*)$",
   "rules_file": "CLAUDE.md",
-  "haiku_brief": "a software project",
+  "project_brief": "a software project",
   "sync": false,
-  "haiku_turns": 40,
-  "haiku_timeout": 1800
+  "task_model": "sonnet",
+  "task_turns": 40,
+  "task_timeout": 1800
 }
