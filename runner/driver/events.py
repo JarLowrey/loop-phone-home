@@ -14,14 +14,14 @@ The kinds and their fields:
   session        model, effort, kind, seconds, turns, cost_usd, is_error, subtype, terminal_reason, tokens_in,
                  tokens_out, cache_read, cache_write, tools ({name: calls}), tool_errors, denials ([reason]),
                  bash_timeouts, test_runs, log (the stream's file)
-  escalate       from, to, reason
+  escalate       from, to, reason, queued (true when it waits for the other slots to be idle)
   catch_up       seconds, landed (commits that landed while the task ran), result
   gate           seconds, test_seconds, totals, reason ('' when passed), log (the test output's file),
                  suite_seconds, suite_limit (from the config's timing_regex, when it matches)
   baseline       head, totals, timed_out, suite_seconds (HEAD's own suite, after a gate timed out)
   land           seconds, lock_wait, rebased, retest_seconds, owner_wait, result, commit
   push           seconds, ok, detail
-  task_end       outcome (landed, blocked, requeued, paused, stopped, crashed), reason, seconds
+  task_end       outcome (landed, blocked, requeued, escalating, paused, stopped, crashed), reason, seconds
   requeue        reason, wait_for, count          block   reason, outcome
   approval       what, seconds, answer           opus_write   seconds, result
   monitor_run    seconds, clean (the clean checkout's verdict), tasks, monitor_exit

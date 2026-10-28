@@ -238,35 +238,66 @@ def worker_attempt(slot, task_id, title, spec, model, effort, feedback):
 def do_worker_task(slot, task_id, title, spec, state):
     """The worker model does the task. If it fails, its changes are undone and the escalation model tries once, with the
     failure as feedback. A second failure blocks the task. Work that passed but could not land is requeued. With
-    approvals on, an Opus or Fable attempt waits for approval first."""
+    approvals on, an Opus or Fable attempt waits for approval first. With more than one slot the escalation does not
+    start here: it is queued (state "escalations"), and the scheduler runs it alone once every other slot has landed
+    its task, so it starts on the newest tree, no other task holds a file it needs, and its wide fixes do not land
+    under running tasks."""
+    queued = (state.get("escalations") or {}).get(task_id)
+    if queued:
+        escalate(slot, task_id, title, spec, state, queued)
+        return
     model, effort = K.worker(state)
-    plan = [(model, effort)]
-    if S.ESCALATE_MODEL and S.MODEL_RANK[S.ESCALATE_MODEL] > S.MODEL_RANK[model]:
-        plan.append((S.ESCALATE_MODEL, effort))
-    reason = ""
-    for index, (who, level) in enumerate(plan):
-        if K.needs_approval(who, level) and not K.approved(
-                state, f"{task_id} {title}: {who}, effort {level or 'default'}, up to ${S.WORKER_BUDGET_USD[who]:g}"):
-            if index == 0:
-                R.pause(state, "Loop paused: not approved", f"{task_id} stays open. Send RESUME to ask again, or "
-                        "MODEL sonnet to use another model.")
-                return
-            reason += f" (the retry by {who} was not approved)"
-            break
-        if index:
-            SL.prepare(slot)
-            R.log(f"{task_id}: {plan[index - 1][0]} failed ({reason}); {who} tries it once")
-            E.emit("escalate", **{"from": plan[index - 1][0], "to": who, "reason": reason[:400]})
-        result = worker_attempt(slot, task_id, title, spec, who, level,
-                                (plan[index - 1][0], reason) if index else None)
-        if result is None:
-            return
-        record_attempt(task_id, who, f"requeued: {result}" if isinstance(result, Requeue) else f"failed: {result}")
-        if isinstance(result, Requeue):
-            T.requeue(slot, task_id, result, state, result.wait_for)
-            return
-        reason = result
-    T.block(slot, task_id, title, reason, "worker_failed")
+    if K.needs_approval(model, effort) and not K.approved(
+            state, f"{task_id} {title}: {model}, effort {effort or 'default'}, up to ${S.WORKER_BUDGET_USD[model]:g}"):
+        R.pause(state, "Loop paused: not approved", f"{task_id} stays open. Send RESUME to ask again, or "
+                "MODEL sonnet to use another model.")
+        return
+    result = worker_attempt(slot, task_id, title, spec, model, effort, None)
+    if result is None:
+        return
+    record_attempt(task_id, model, f"requeued: {result}" if isinstance(result, Requeue) else f"failed: {result}")
+    if isinstance(result, Requeue):
+        T.requeue(slot, task_id, result, state, result.wait_for)
+        return
+    if not (S.ESCALATE_MODEL and S.MODEL_RANK[S.ESCALATE_MODEL] > S.MODEL_RANK[model]):
+        T.block(slot, task_id, title, result, "worker_failed")
+        return
+    queued = {"from": model, "effort": effort, "reason": str(result)}
+    if S.PARALLEL_SLOTS <= 1:
+        SL.prepare(slot)
+        escalate(slot, task_id, title, spec, state, queued)
+        return
+    SL.revert(slot, f"{model} failed; {S.ESCALATE_MODEL} runs it alone next: {str(result)[:200]}")
+    with R.STATE_LOCK:
+        state.setdefault("escalations", {})[task_id] = queued
+        R.write_driver_state(state)
+    R.log(f"{task_id}: {model} failed ({result}); {S.ESCALATE_MODEL} runs it alone once the other slots are idle")
+    R.ctx().update(outcome="escalating", reason=str(result)[:400])
+    E.emit("escalate", **{"from": model, "to": S.ESCALATE_MODEL, "reason": str(result)[:400], "queued": True})
+
+
+def escalate(slot, task_id, title, spec, state, queued):
+    """The escalation model's one attempt, with the worker's failure as feedback. A failure, or a denied approval,
+    blocks the task."""
+    who, level = S.ESCALATE_MODEL or queued["from"], queued.get("effort")
+    with R.STATE_LOCK:
+        (state.get("escalations") or {}).pop(task_id, None)
+        R.write_driver_state(state)
+    reason = queued["reason"]
+    if K.needs_approval(who, level) and not K.approved(
+            state, f"{task_id} {title}: {who}, effort {level or 'default'}, up to ${S.WORKER_BUDGET_USD[who]:g}"):
+        T.block(slot, task_id, title, f"{reason} (the retry by {who} was not approved)", "worker_failed")
+        return
+    R.log(f"{task_id}: {queued['from']} failed ({reason}); {who} tries it once")
+    E.emit("escalate", **{"from": queued["from"], "to": who, "reason": reason[:400]})
+    result = worker_attempt(slot, task_id, title, spec, who, level, (queued["from"], reason))
+    if result is None:
+        return
+    record_attempt(task_id, who, f"requeued: {result}" if isinstance(result, Requeue) else f"failed: {result}")
+    if isinstance(result, Requeue):
+        T.requeue(slot, task_id, result, state, result.wait_for)
+        return
+    T.block(slot, task_id, title, result, "worker_failed")
 
 
 def is_opus_task(spec):

@@ -40,6 +40,8 @@ CONFIG_DEFAULTS = {
     "timing_regex": "",                     # optional: a line of the test output with (seconds, limit) groups,
                                             # e.g. "slowest shard ([\\d.]+) s of its (\\d+) s limit"
     "timeout_markers": ["TIMED OUT"],       # words in the test output that mean it ran out of time
+    "test_jobs_env": "",                    # optional: an environment variable the test command reads for how many
+                                            # processes to use; the driver sets it to the CPUs shared among the slots
     "test_one_hint": "",                    # optional: how a session runs one test file, for its prompt
     "test_files": [],                       # globs of the test files, e.g. "tests/**/test_*.py"
     "test_function_regex": r"^\s*(?:async\s+)?(?:static\s+)?(?:def|func|function|fn)\s+(test_?\w+)\s*\(",
@@ -213,7 +215,7 @@ def main_branch():
     return git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
 
 
-def test_output(timeout=None, root=None, args=()):
+def test_output(timeout=None, root=None, args=(), env=None):
     """The test command's printed output, run from the root of the tree under test (a slot's worktree, or the main
     tree). A run longer than timeout (test_timeout by default) is ended with everything it started, and its output then
     has no totals line, so it counts as failed."""
@@ -222,6 +224,7 @@ def test_output(timeout=None, root=None, args=()):
         command = f"{command} {' '.join(args)}"
     limit = timeout or CFG.test_timeout
     process = subprocess.Popen(command, shell=isinstance(command, str), cwd=root or PROJECT, stdout=subprocess.PIPE,
+                               env={**os.environ, **env} if env else None,
                                stderr=subprocess.STDOUT, text=True, errors="replace",
                                start_new_session=os.name != "nt")
     try:

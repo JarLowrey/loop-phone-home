@@ -81,6 +81,7 @@
   "fail_markers": [],
   "timing_regex": "",
   "timeout_markers": ["TIMED OUT"],
+  "test_jobs_env": "",
   "test_one_hint": "",
   "test_files": [
     "tests/**/test_*.py"

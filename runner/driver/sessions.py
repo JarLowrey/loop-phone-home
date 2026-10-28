@@ -41,7 +41,8 @@ def task_settings(slot=None, deadline=0.0):
     if slot is not None:
         command += f' --root "{slot.root}" --slot {slot.name} --leases "{SL.LEASES}" --logs "{C.CFG.logs_dir}"'
         command += "".join(f' --forbid "{tree}"' for tree in SL.other_roots(slot))
-    return json.dumps({"env": {"BASH_DEFAULT_TIMEOUT_MS": BASH_TIMEOUT_MS, "BASH_MAX_TIMEOUT_MS": BASH_TIMEOUT_MS},
+    return json.dumps({"env": {"BASH_DEFAULT_TIMEOUT_MS": BASH_TIMEOUT_MS, "BASH_MAX_TIMEOUT_MS": BASH_TIMEOUT_MS,
+                               **test_env()},
                        "hooks": {"PreToolUse": [{"matcher": HOOKED_TOOLS, "hooks": [
                            {"type": "command", "command": command, "timeout": 10}]}]}})
 
@@ -84,10 +85,18 @@ def poll_while(stop):
             R.log(f"command poll failed: {error}")
 
 
+def test_env():
+    """{test_jobs_env: how many processes one test run may use}: the CPUs shared out among the slots, 2 to 8, so
+    slots that test at once do not starve each other. Empty without test_jobs_env in the config."""
+    if not C.CFG.test_jobs_env:
+        return {}
+    return {C.CFG.test_jobs_env: str(max(2, min(8, (os.cpu_count() or 4) // max(1, S.PARALLEL_SLOTS))))}
+
+
 def run_tests(root=None):
     """The test run in the main tree or a slot, with the phone answered meanwhile, since a run takes minutes."""
     with polling():
-        return C.test_output(root=root)
+        return C.test_output(root=root, env=test_env())
 
 
 def tests_summary(output):

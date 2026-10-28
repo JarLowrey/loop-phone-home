@@ -6,6 +6,8 @@ it looks at the next parallel_window open tasks that are not running, in file or
 - shares no file with a running task (its Files line and the files its session took since), nor with an earlier task
   it would pass, so every file still changes in file order. A shared file is the exception, while the two tasks' specs
   name no function of it in common (two tasks that both change end_fight never run together).
+A task whose worker failed and that waits for the escalation model (state "escalations") comes first: nothing new starts
+until every slot is idle, and then it runs alone.
 Each task runs in its own thread, in its own slot; the main thread's loop answers the phone and calls fill() and wait()."""
 import re
 import threading
@@ -66,7 +68,8 @@ class Scheduler:
         """True for a task that runs only when nothing else does: an Opus task, a task whose Files line names nothing
         (so its files cannot be known), and one that could not land max_requeues times."""
         requeued = (self.state.get("requeues") or {}).get(task_id, 0)
-        return RN.is_opus_task(spec) or not W.task_files(spec) or requeued >= S.MAX_REQUEUES
+        return (RN.is_opus_task(spec) or not W.task_files(spec) or requeued >= S.MAX_REQUEUES
+                or task_id in (self.state.get("escalations") or {}))
 
     def depends(self, task_id, spec, earlier, open_ids):
         """The open tasks this one must wait for: its After line, the earlier open tasks it names or that name it, and
@@ -100,6 +103,12 @@ class Scheduler:
         self.wait_next = waiting[0][0] if waiting else None
         if not waiting:
             return self.waits("no open task is waiting")
+        escalated = [item for item in waiting if item[0] in (self.state.get("escalations") or {})]
+        if escalated:
+            task_id, title = escalated[0]
+            if running:
+                return self.waits(f"{task_id} waits for every slot to be idle, then {S.ESCALATE_MODEL} runs it alone")
+            return task_id, title, C.find_spec(task_id, text)
         if not running:
             task_id, title = waiting[0]
             return task_id, title, C.find_spec(task_id, text)

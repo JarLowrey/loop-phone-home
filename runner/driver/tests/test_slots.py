@@ -364,6 +364,17 @@ class SchedulerTest(DriverTest):
         self.running("M3-R", text=text)
         self.assertIsNone(self.pick(text))
 
+    def test_an_escalation_drains_the_slots_then_runs_alone(self):
+        R.RUNTIME["state"]["escalations"] = {"M3-03": {"from": "sonnet", "reason": "tests fail"}}
+        self.running("M3-01")
+        self.assertIsNone(self.pick(), "nothing new starts while a slot is busy")
+        self.assertIn("M3-03 waits for every slot to be idle", self.scheduler.wait_reason)
+        self.scheduler.slots["1"].task = None
+        L.release(SL.LEASES, "1")
+        self.assertEqual(self.pick(), "M3-03", "it goes before earlier open tasks")
+        self.running("M3-03")
+        self.assertIsNone(self.pick(), "and runs alone")
+
     def test_the_window_and_the_after_line(self):
         text = self.TEXT.replace("### [ ] M3-03", "### [x] M3-03").replace("**Who.** Opus\n", "")
         text = text.replace("Change any file under `game/src`", "Change `src/r.gd`")

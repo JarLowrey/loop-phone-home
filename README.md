@@ -44,7 +44,7 @@ flowchart TD
     gate -->|pass| land{Landing: rebase, merge added lines,<br/>doubled names, re-test if work landed}
     land -->|lands| ff[Branch fast-forwards, task marked done,<br/>push, phone digest]
     land -->|conflict| requeue[Requeued: runs again later,<br/>alone after max_requeues]
-    gate -->|fail| retry[Undone; escalate_model tries once<br/>with the failure as feedback]
+    gate -->|fail| retry[Undone; once the other slots are idle,<br/>escalate_model tries once, alone,<br/>with the failure as feedback]
     retry -->|fails again| block[Blocked; two in a row start an Opus triage]
 ```
 
@@ -53,7 +53,7 @@ flowchart TD
   the way it waits and tells you which.
 - **Side by side, safely.** `parallel_slots` tasks run at once. A task waits while a running task holds one of its files
   (its **Files.** line, plus files its session takes), names it, or is named by its **After.** line. A hook refuses a
-  session's edits to another slot's files. Reviews and other **Who.** Opus tasks run alone.
+  session's edits to another slot's files. Reviews, other **Who.** Opus tasks and escalations run alone.
 - **Only checked work lands.** The driver runs the tests itself and checks the scope, removed or weakened tests, and
   the task's **Done when.** line. Work that landed meanwhile is merged in and tested again before anything lands.
 - **It looks after itself.** A supervisor restarts it after a crash; it pauses at the usage limit or the daily budget

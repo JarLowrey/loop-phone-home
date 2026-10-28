@@ -23,7 +23,8 @@ nothing changed outside the scope, no loop-folder file the task does not name, n
 unless the task names it, the tests pass, and the task's Done when line holds. Then, one slot at a time, it is rebased
 onto the newest commit (added lines on both sides are merged), checked for doubled names and tested again if other work
 landed meanwhile, and the main branch fast-forwards to it. Work that cannot land goes back to the queue. A task that
-fails is undone and tried once more by escalate_model with the failure as feedback; a second failure blocks it. Two
+fails is undone and tried once more by escalate_model (alone, once the other slots have landed their tasks) with
+the failure as feedback; a second failure blocks it. Two
 blocks in a row start an Opus triage; two more after it pause the driver. A task whose Who line says Opus runs alone.
 A gate whose tests run out of time is checked against HEAD's own suite: when HEAD's times out too, the fault is not the
 task's, so it stays open and the driver pauses. From 5 minutes before a session's time limit the task hook refuses its

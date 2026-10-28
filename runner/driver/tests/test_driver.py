@@ -231,6 +231,25 @@ class EscalationTest(DriverTest):
         self.assertEqual(len(calls), 1)
         block.assert_called_once()
 
+    def test_with_two_slots_the_escalation_is_queued_then_runs_with_the_feedback(self):
+        state = R.RUNTIME["state"]
+        state["worker_model"] = "sonnet"
+        calls = []
+
+        def attempt(slot, task_id, title, spec, who, level, feedback):
+            calls.append((who, feedback))
+            return "tests fail" if who == "sonnet" else None
+        with mock.patch.object(S, "PARALLEL_SLOTS", 2), mock.patch.object(S, "ESCALATE_MODEL", "opus"),                 mock.patch.object(RN, "worker_attempt", attempt), mock.patch.object(K, "approved", return_value=True),                 mock.patch.object(SL, "revert") as revert, mock.patch.object(T, "block") as block:
+            RN.do_worker_task(fake_slot(), "M2-30", "x", "spec", state)
+            self.assertEqual(calls, [("sonnet", None)])
+            self.assertEqual(state["escalations"]["M2-30"]["reason"], "tests fail")
+            self.assertEqual(R.ctx()["outcome"], "escalating")
+            revert.assert_called_once()
+            RN.do_worker_task(fake_slot(), "M2-30", "x", "spec", state)
+        self.assertEqual(calls[1], ("opus", ("sonnet", "tests fail")))
+        self.assertNotIn("M2-30", state["escalations"])
+        block.assert_not_called()
+
     def test_denied_first_attempt_pauses_and_leaves_the_task_open(self):
         state = {"worker_model": "fable"}
         with mock.patch.object(K, "approved", return_value=False), mock.patch.object(RN, "worker_attempt") as attempt, \
