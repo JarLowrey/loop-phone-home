@@ -102,11 +102,14 @@ this session, in order:
    write disagrees with a worked example, the test is wrong: fix the test to match the task.
 2. Write the code and the tests under <scope> only. Create only the files the task's Files line lists. Use Read, Edit,
    Write, Glob and Grep, with paths from the project root. Never delete or weaken an existing test. Change an existing
-   test only where the task says so, and only as it says.
+   test only where the task says so, and only as it says. If the task cannot pass without changing a file its Files line
+   does not name (under <scope>), change it as little as you can, and say in your last message which file and why: a
+   missing name in a Files line is a gap in the task, not a reason to stop.
 3. Run the tests with: <tests> . Fix every failure and run again, until a run passes.
 4. Check the task's **Done when.** line yourself: every test it names exists, every file it names is written, and the
    test run prints every output it names. The driver checks the same line and blocks the task if any part is missing.
-5. Then stop. Your last message is the list of files you changed and the totals line from the last run, nothing else.
+5. Then stop. Your last message is the list of files you changed and the totals line from the last run. If you could
+   not finish, it says instead what you found: the cause, the fix you would make, and what you checked.
 
 Read only what you need: every file you read stays in the conversation and is paid for on every later turn. Your task
 and the design parts it names are below, so do not open <tasks>, <progress><design> unless the task names a design
@@ -136,4 +139,11 @@ An earlier attempt at this task, by {model}, failed and was undone, so you start
 
 That attempt's test output (failures and totals):
 {tests}
+"""
+
+ATTEMPTS_NOTE = """
+
+Earlier attempts at this task, oldest first. Their changes were undone, but what they found still holds unless the code
+changed since: start from it rather than finding it again.
+{attempts}
 """

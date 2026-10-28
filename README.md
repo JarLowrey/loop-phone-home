@@ -57,7 +57,9 @@ flowchart TD
 - **Only checked work lands.** The driver runs the tests itself and checks the scope, removed or weakened tests, and
   the task's **Done when.** line. Work that landed meanwhile is merged in and tested again before anything lands.
 - **It looks after itself.** A supervisor restarts it after a crash; it pauses at the usage limit or the daily budget
-  and resumes on its own; blocks in a row start an Opus triage; every few landings a fresh checkout is tested.
+  and resumes on its own; blocks in a row start an Opus triage; every few landings a fresh checkout is tested. A test
+  run that times out is checked against the branch's own suite, so a slow suite pauses the loop instead of failing
+  tasks, and what each attempt found is handed to the next one.
 
 ## Set up
 

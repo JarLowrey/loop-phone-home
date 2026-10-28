@@ -25,6 +25,10 @@ onto the newest commit (added lines on both sides are merged), checked for doubl
 landed meanwhile, and the main branch fast-forwards to it. Work that cannot land goes back to the queue. A task that
 fails is undone and tried once more by escalate_model with the failure as feedback; a second failure blocks it. Two
 blocks in a row start an Opus triage; two more after it pause the driver. A task whose Who line says Opus runs alone.
+A gate whose tests run out of time is checked against HEAD's own suite: when HEAD's times out too, the fault is not the
+task's, so it stays open and the driver pauses. From 5 minutes before a session's time limit the task hook refuses its
+every tool call, so it ends by saying what it found; that, and each earlier attempt's last message, reach the task's
+next attempt. With timing_regex set, the phone hears once a day when the test run passes 60% of its limit.
 
 Config: worker.json (loop_common.CONFIG_DEFAULTS lists every key the driver reads). The loop file (loop_file) holds a
 driver-settings block, read again at each pass, so an edit takes effect without a restart.

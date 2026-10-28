@@ -475,6 +475,107 @@ class LoopProblemTest(DriverTest):
         self.assertIn("- M2-30: kept", text)
 
 
+class SlowSuiteTest(DriverTest):
+    """A test run that runs out of time is checked against HEAD's own suite, and a suite near its limit is reported."""
+    TIMED_OUT = "unit tests TIMED OUT after 300 s in shard 2 of 4: in test_m3_fights.gd, after test_x\nunit tests exit=124"
+    PASSED = ("617 passed, 0 failed\nunit tests: 41.8 s in 4 shard(s); slowest shard 41.8 s of its 300 s limit; "
+              "slowest files: test_fight_harness.gd 32.9 s")
+
+    def head_suite(self, output):
+        def prepare(slot, fresh=False):
+            slot.base = "abc1234567"
+            return slot.base
+        with mock.patch.object(SL, "prepare", prepare), mock.patch.object(X, "run_tests", return_value=output), \
+                mock.patch.object(SL, "revert") as revert:
+            note = RN.suite_fault(fake_slot(), "M3-17")
+        return note, revert
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(C.CFG, "timing_regex", r"slowest shard ([\d.]+) s of its (\d+) s limit")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_timing_line_and_timeouts_are_read(self):
+        self.assertEqual(C.suite_load(self.PASSED), (41.8, 300))
+        self.assertIsNone(C.suite_load("617 passed, 0 failed"))
+        self.assertTrue(C.timed_out(self.TIMED_OUT))
+        self.assertTrue(C.timed_out("test run timed out after 1800 s"))
+        self.assertFalse(C.timed_out(self.PASSED))
+
+    def test_head_too_slow_pauses_and_leaves_the_task_open(self):
+        note, revert = self.head_suite(self.TIMED_OUT)
+        self.assertIsNone(note)
+        revert.assert_called_once()
+        self.assertTrue(R.RUNTIME["state"]["paused"])
+        self.assertEqual(self.posts[-1][0], "Driver paused: the test suite fails on HEAD")
+
+    def test_head_passing_blames_the_change(self):
+        note, revert = self.head_suite(self.PASSED)
+        self.assertIn("HEAD's own suite passes", note)
+        self.assertIn("41.8 s of 300 s", note)
+        self.assertIn("617 passed, 0 failed", note)
+        revert.assert_not_called()
+        self.assertFalse(R.RUNTIME["state"].get("paused"))
+
+    def test_a_suite_near_its_limit_is_told_once_a_day(self):
+        RN.warn_suite_load((150.0, 300))
+        self.assertEqual(self.posts, [])
+        RN.warn_suite_load((200.0, 300))
+        RN.warn_suite_load((250.0, 300))
+        self.assertEqual([title for title, _, _ in self.posts], ["Test suite near its limit"])
+
+
+class AttemptMemoryTest(DriverTest):
+    """What a session said at the end reaches the task's next attempt, and a session past its deadline is told to
+    write it."""
+
+    def test_last_words_reach_the_next_attempt_until_the_task_lands(self):
+        state = R.RUNTIME["state"]
+        R.ctx()["last_words"] = "The cause: CrewAi._send_defenders keeps the pilot at the Helm."
+        RN.record_attempt("M3-17", "opus", "requeued: it needed crew_ai.gd")
+        note = RN.attempts_note("M3-17")
+        self.assertIn("_send_defenders", note)
+        self.assertIn("opus", note)
+        self.assertIn("requeued: it needed crew_ai.gd", note)
+        self.assertEqual(RN.attempts_note("M3-18"), "")
+        T.task_committed(state, "M3-17")
+        self.assertEqual(RN.attempts_note("M3-17"), "")
+
+    def test_only_the_last_attempts_are_kept(self):
+        for index in range(S.MAX_ATTEMPTS_KEPT + 2):
+            R.ctx()["last_words"] = f"attempt {index}"
+            RN.record_attempt("M3-17", "sonnet", "failed")
+        kept = R.RUNTIME["state"]["attempts"]["M3-17"]
+        self.assertEqual(len(kept), S.MAX_ATTEMPTS_KEPT)
+        self.assertEqual(kept[-1]["words"], f"attempt {S.MAX_ATTEMPTS_KEPT + 1}")
+
+    def test_a_failed_attempt_is_recorded_before_the_escalation(self):
+        def attempt(slot, task_id, title, spec, who, level, feedback):
+            R.ctx()["last_words"] = f"{who} found the cause"
+            return "tests fail" if who == "sonnet" else None
+        with mock.patch.object(S, "ESCALATE_MODEL", "opus"), mock.patch.object(RN, "worker_attempt", attempt), \
+                mock.patch.object(K, "approved", return_value=True), mock.patch.object(SL, "prepare"):
+            RN.do_worker_task(fake_slot(), "M2-30", "x", "spec", {"worker_model": "sonnet"})
+        kept = R.RUNTIME["state"]["attempts"]["M2-30"]
+        self.assertEqual([(item["model"], item["outcome"]) for item in kept], [("sonnet", "failed: tests fail")])
+
+    def test_a_killed_session_gives_its_last_words(self):
+        text = X.failure_text("opus", 1, 1800, {}, ["Every seed now ends. Running the suite."])
+        self.assertIn("no result", text)
+        self.assertIn("Every seed now ends", text)
+        self.assertNotIn("last words", X.failure_text("opus", 1, 10, {"result": "an error"}, ["said"]))
+
+    def test_the_hook_refuses_every_call_after_the_deadline(self):
+        import task_hook as TH
+        read = {"tool_name": "Read", "tool_input": {"file_path": "x.gd"}}
+        self.assertEqual(TH.decide(read, str(self.temp), "1", "", [], time.time() - 1), TH.DEADLINE_REASON)
+        self.assertEqual(TH.decide(read, str(self.temp), "1", "", [], time.time() + 600), "")
+        self.assertEqual(TH.decide(read, str(self.temp), "1", "", []), "")
+        self.assertIn("--deadline 1234", X.task_settings(None, 1234.0))
+        self.assertIn("Read", X.HOOKED_TOOLS)
+
+
 class MonitorTest(DriverTest):
     def test_the_monitor_runs_every_few_landings_and_alerts_on_a_failure(self):
         import monitor

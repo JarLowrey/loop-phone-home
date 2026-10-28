@@ -16,7 +16,9 @@ The kinds and their fields:
                  bash_timeouts, test_runs, log (the stream's file)
   escalate       from, to, reason
   catch_up       seconds, landed (commits that landed while the task ran), result
-  gate           seconds, test_seconds, totals, reason ('' when passed), log (the test output's file)
+  gate           seconds, test_seconds, totals, reason ('' when passed), log (the test output's file),
+                 suite_seconds, suite_limit (from the config's timing_regex, when it matches)
+  baseline       head, totals, timed_out, suite_seconds (HEAD's own suite, after a gate timed out)
   land           seconds, lock_wait, rebased, retest_seconds, owner_wait, result, commit
   push           seconds, ok, detail
   task_end       outcome (landed, blocked, requeued, paused, stopped, crashed), reason, seconds

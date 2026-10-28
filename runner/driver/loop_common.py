@@ -37,6 +37,9 @@ CONFIG_DEFAULTS = {
     "totals_marker": "passed, ",            # text that marks the totals line in the test output
     "pass_marker": " 0 failed",             # text in the totals line when everything passed
     "fail_markers": [],                     # lines that start with one of these fail the run, e.g. "smoke: FAIL"
+    "timing_regex": "",                     # optional: a line of the test output with (seconds, limit) groups,
+                                            # e.g. "slowest shard ([\\d.]+) s of its (\\d+) s limit"
+    "timeout_markers": ["TIMED OUT"],       # words in the test output that mean it ran out of time
     "test_one_hint": "",                    # optional: how a session runs one test file, for its prompt
     "test_files": [],                       # globs of the test files, e.g. "tests/**/test_*.py"
     "test_function_regex": r"^\s*(?:async\s+)?(?:static\s+)?(?:def|func|function|fn)\s+(test_?\w+)\s*\(",
@@ -234,6 +237,18 @@ def test_output(timeout=None, root=None, args=()):
 def totals_line(output):
     totals = [line for line in output.splitlines() if CFG.totals_marker in line]
     return totals[-1] if totals else ""
+
+
+def suite_load(output):
+    """How close the test run came to its time limit, from timing_regex: (seconds, limit), or None."""
+    match = re.search(CFG.timing_regex, output or "") if CFG.timing_regex else None
+    return (float(match.group(1)), int(match.group(2))) if match else None
+
+
+def timed_out(output):
+    """True when the test run (or a part of it) ran out of time: the driver's own limit, or a timeout_marker."""
+    output = output or ""
+    return "test run timed out" in output or any(marker in output for marker in CFG.timeout_markers or ())
 
 
 def test_failure(output):

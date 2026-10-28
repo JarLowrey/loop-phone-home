@@ -215,6 +215,23 @@ def report(events):
         print(f"    {count:3} x {denial}")
     print(f"failed tool calls: {errors}; test runs by sessions: {tests}; turns: {turns}")
 
+    section("Test suite time (gate runs)")
+    gates = [event for event in events if event["event"] == "gate" and event.get("test_seconds")]
+    if gates:
+        print("  the gate's test run by hour, median (the longest of its limit, when timing_regex matched):")
+        by_hour = collections.defaultdict(list)
+        for event in gates:
+            by_hour[event["time"][:13]].append(event)
+        for hour, found in sorted(by_hour.items())[-12:]:
+            seconds = sorted(event["test_seconds"] for event in found)
+            timed = [event for event in found if event.get("suite_seconds") and event.get("suite_limit")]
+            share = (f", longest {max(e['suite_seconds'] for e in timed):.0f} s of {timed[0]['suite_limit']} s"
+                     if timed else "")
+            print(f"    {hour}:00  {len(found):3} runs, median {seconds[len(seconds) // 2]:.0f} s{share}")
+    for event in (event for event in events if event["event"] == "baseline"):
+        print(f"  HEAD check {event['time']} ({event.get('task')}): {event.get('totals') or 'no totals'}, "
+              f"timed out: {event.get('timed_out')}")
+
     section("Pauses, pushes and monitor runs")
     pauses = collections.Counter(event.get("title") for event in events if event["event"] == "pause")
     for title, count in pauses.most_common():

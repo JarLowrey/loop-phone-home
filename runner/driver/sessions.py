@@ -18,8 +18,11 @@ import slots as SL
 # the phone's command handler; commands.py sets it, so this module need not import that one
 HANDLE_COMMANDS = None
 TASK_HOOK = pathlib.Path(__file__).resolve().parent / "task_hook.py"
-# the tools the task hook checks: the shell, and every tool that writes a file
-HOOKED_TOOLS = "Bash|Edit|Write|MultiEdit|NotebookEdit"
+# the tools the task hook checks: all of them, since past its deadline it refuses every call
+HOOKED_TOOLS = "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep"
+# why: a session killed at its time limit leaves no last message, and one such kill lost a whole diagnosis; from this
+# many seconds before the limit the task hook refuses every tool call, so the session ends by writing what it found
+WRAP_UP_SECONDS = 300
 # why: Claude Code moves a Bash command to the background after 2 minutes, and a test run with two slots takes 110 s or
 # more, so a session's own test runs were cut off and polled; 10 minutes covers a run under load
 BASH_TIMEOUT_MS = "600000"
@@ -28,10 +31,13 @@ DENIAL_MARKERS = ("cd is refused", "another copy of the project", "This session 
 BASH_TIMEOUT_MARKER = "did not complete within"
 
 
-def task_settings(slot=None):
-    """The --settings of a task session: the task hook, with its slot's root, lease file and the trees it must not
-    touch. Passed with --settings, so only the driver's sessions get it, not the owner's own."""
+def task_settings(slot=None, deadline=0.0):
+    """The --settings of a task session: the task hook, with its slot's root, lease file, the trees it must not touch
+    and the time from which it refuses every call. Passed with --settings, so only the driver's sessions get it, not
+    the owner's own."""
     command = f'"{sys.executable}" "{TASK_HOOK}"'
+    if deadline:
+        command += f" --deadline {deadline:.0f}"
     if slot is not None:
         command += f' --root "{slot.root}" --slot {slot.name} --leases "{SL.LEASES}" --logs "{C.CFG.logs_dir}"'
         command += "".join(f' --forbid "{tree}"' for tree in SL.other_roots(slot))
@@ -173,7 +179,8 @@ def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, sl
                "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep",
                "--disallowedTools", *C.DISALLOWED_TOOLS, "--disable-slash-commands", "--strict-mcp-config",
                "--output-format", "stream-json", "--verbose", "--max-turns", str(turns),
-               "--max-budget-usd", str(budget), "--settings", task_settings(slot)]
+               "--max-budget-usd", str(budget),
+               "--settings", task_settings(slot, time.time() + timeout - min(WRAP_UP_SECONDS, timeout // 4))]
     if effort:
         command += ["--effort", effort]
     key = slot.name if slot is not None else kind
@@ -222,6 +229,7 @@ def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, sl
         B.release_reservation()
     seconds = round(time.time() - started)
     R.ctx()["last_session"] = {"turns": result.get("num_turns") or 0, "seconds": seconds, "steps": steps}
+    R.ctx()["last_words"] = str(result.get("result") or "").strip() or "\n\n".join(texts[-3:])[-3000:]
     session_event(stats, result, model, effort, kind, seconds, raw_log)
     if stats.bash_timeouts:
         R.log(f"{model}: {stats.bash_timeouts} Bash command(s) ran past Claude Code's timeout and went to the background")
@@ -233,14 +241,15 @@ def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, sl
         R.log(f"{model} finished in {seconds} s: {result.get('num_turns')} turns, cost {result.get('total_cost_usd')} "
               f"USD, error {bool(result.get('is_error'))}, {result.get('subtype', '')}")
     if not result or result.get("is_error") or not result.get("result"):
-        return "", failure_text(model, code, seconds, result)
+        return "", failure_text(model, code, seconds, result, texts)
     return str(result["result"]).strip() or "\n".join(texts), ""
 
 
-def failure_text(model, code, seconds, result):
+def failure_text(model, code, seconds, result, texts=()):
     """Why a session failed, in one line. A session stopped by a limit (max_turns, a budget) says which, with its turns,
     since its result text is often empty and "exit 1" alone reads as a crash."""
     detail = str(result.get("result") or result.get("subtype") or "no result")[:300]
     reason = result.get("terminal_reason") or ""
     stopped = f", stopped by {reason} after {result.get('num_turns')} turns" if reason and reason != "completed" else ""
-    return f"the {model} session ended with exit {code} after {seconds} s{stopped}: {detail}"
+    said = f". Its last words: {texts[-1][:400]}" if texts and not result.get("result") else ""
+    return f"the {model} session ended with exit {code} after {seconds} s{stopped}: {detail}{said}"

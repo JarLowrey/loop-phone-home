@@ -4,7 +4,9 @@ keeps it there:
   project root writes its files under the wrong path, such as src/src/;
 - a Bash command that names the owner's main tree or another slot is refused;
 - an Edit or Write outside the slot's own worktree is refused, and so is one to a file that another running task holds
-  (leases.py). A file nobody holds is leased to this slot as it is written.
+  (leases.py). A file nobody holds is leased to this slot as it is written;
+- from its --deadline on (a few minutes before the driver would kill the session), every tool call is refused with an
+  order to write the last message now, so a session that ran out of time still says what it found.
 The driver passes it to each task session with --settings and its slot's arguments (--root, --slot, --leases and one
 --forbid per other tree); the owner's own sessions do not get it. It reads the hook's JSON on stdin and prints a deny
 decision, or nothing to let the call run."""
@@ -13,6 +15,7 @@ import json
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import leases as L  # noqa: E402
@@ -25,6 +28,9 @@ CD_REASON = ("cd is refused in task sessions: run every command from the project
 OTHER_TREE_REASON = ("This session works in its own copy of the project, the folder it started in. Commands and edits "
                      "must stay in it: {path} is another copy (the owner's, or another task's).")
 WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+DEADLINE_REASON = ("Time is up for this session: no more tool calls. Write your last message now: what you changed, "
+                   "what you found (the cause, the fix you would make, what you checked), and what is left. The "
+                   "driver keeps it for the next attempt.")
 # files a session may write anywhere in its slot without a lease: the logs folder (--logs sets it)
 LOGS_PREFIX = "loop/logs/"
 
@@ -57,8 +63,10 @@ def inside(path, tree):
     return path == tree or path.startswith(tree.rstrip("\\/") + os.sep)
 
 
-def decide(event, root, slot, leases, forbid):
+def decide(event, root, slot, leases, forbid, deadline=0.0):
     """The reason to refuse this tool call, or '' to let it run."""
+    if deadline and time.time() >= deadline:
+        return DEADLINE_REASON
     tool = event.get("tool_name")
     given = event.get("tool_input") or {}
     if tool == "Bash":
@@ -94,6 +102,7 @@ def main():
     parser.add_argument("--slot", default="")
     parser.add_argument("--leases", default="")
     parser.add_argument("--forbid", action="append", default=[])
+    parser.add_argument("--deadline", type=float, default=0.0)
     parser.add_argument("--logs", default="")
     args = parser.parse_args()
     global LOGS_PREFIX
@@ -102,7 +111,7 @@ def main():
         event = json.load(sys.stdin)
     except ValueError:
         return 0
-    reason = decide(event, args.root, args.slot, args.leases, args.forbid)
+    reason = decide(event, args.root, args.slot, args.leases, args.forbid, args.deadline)
     if reason:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                  "permissionDecisionReason": reason}}))

@@ -79,6 +79,8 @@
   "assert_regex": "\\bassert\\w*\\b|\\bexpect\\s*\\(|\\bfail\\s*\\(",
   "design_file": "",
   "fail_markers": [],
+  "timing_regex": "",
+  "timeout_markers": ["TIMED OUT"],
   "test_one_hint": "",
   "test_files": [
     "tests/**/test_*.py"

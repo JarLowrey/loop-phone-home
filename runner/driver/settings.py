@@ -90,6 +90,10 @@ REQUEUE_ALERT_MIN = 5
 # blocks in a row that start an Opus triage, and the blocks in a row after a triage that pause the driver
 TRIAGE_AFTER_BLOCKS = 2
 PAUSE_AFTER_TRIAGE_BLOCKS = 2
+# the share of its time limit the test run may take (from timing_regex) before the phone is told, once a day
+SUITE_WARN_SHARE = 0.6
+# earlier attempts at a task whose last words the next attempt's prompt carries
+MAX_ATTEMPTS_KEPT = 3
 
 
 def read_settings(text):

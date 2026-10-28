@@ -210,6 +210,7 @@ def task_committed(state, task_id=None):
             state.setdefault("monitor_pending", []).append(task_id)
             (state.get("requeues") or {}).pop(task_id, None)
             (state.get("waits") or {}).pop(task_id, None)
+            (state.get("attempts") or {}).pop(task_id, None)
             count_day(state, "landed")
         R.write_driver_state(state)
 

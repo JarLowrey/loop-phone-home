@@ -2,6 +2,7 @@
 or block that follows. RUNNERS lists the kinds of task; a new kind is one more row."""
 import datetime
 import re
+import threading
 import traceback
 
 import budget as B
@@ -18,6 +19,9 @@ import settings as S
 import slots as SL
 import tasks as T
 import workspace as W
+
+# one HEAD check at a time: two slots whose gates time out together share the baseline slot
+BASELINE_LOCK = threading.Lock()
 
 
 class Requeue(str):
@@ -51,8 +55,78 @@ def check_passed(slot, spec, opus=False):
     if found["output"]:
         log = f"{R.ctx().get('task', 'task')}.gate.{E.stamp()}.log"
         (C.LOGS / log).write_text(found["output"] + "\n", encoding="utf-8", newline="\n")
-    E.emit("gate", seconds=timer.seconds(), test_seconds=found["test_seconds"], totals=totals, reason=reason, log=log)
+    load = C.suite_load(found["output"])
+    E.emit("gate", seconds=timer.seconds(), test_seconds=found["test_seconds"], totals=totals, reason=reason, log=log,
+           suite_seconds=load[0] if load else None, suite_limit=load[1] if load else None)
+    R.ctx()["gate_output"] = found["output"]
+    warn_suite_load(load)
     return reason, totals
+
+
+def warn_suite_load(load):
+    """Tells the phone once a day when the test run took more than SUITE_WARN_SHARE of its time limit (timing_regex
+    in the config), before a slow suite starts failing tasks that did nothing wrong."""
+    state = R.RUNTIME.get("state")
+    if not load or state is None or load[0] < S.SUITE_WARN_SHARE * load[1]:
+        return
+    today = datetime.date.today().isoformat()
+    with R.STATE_LOCK:
+        if state.get("suite_warned") == today:
+            return
+        state["suite_warned"] = today
+        R.write_driver_state(state)
+    R.log(f"test suite near its limit: {load[0]:g} s of {load[1]} s")
+    P.post("Test suite near its limit", f"The test run took {load[0]:g} s of its {load[1]} s limit "
+           f"({R.ctx().get('task', 'a gate')}). Past the limit every task fails its gate. Make the slow tests cheaper, "
+           "or run them in parallel. The gate's log has the output.", "high")
+
+
+def suite_fault(slot, task_id):
+    """After a gate whose tests ran out of time: the same tests on HEAD, with no task's changes, in the baseline slot.
+    If HEAD's own suite times out or fails, the fault is not the task's: its work is undone, it stays open, and the
+    driver pauses with an alert; returns None. Otherwise returns a note for the task's failure reason."""
+    with BASELINE_LOCK:
+        baseline = SL.Slot("baseline")
+        SL.prepare(baseline)
+        R.log(f"{task_id}: the gate's tests ran out of time; running HEAD's own suite ({baseline.base[:10]})")
+        output = X.run_tests(baseline.root)
+    failure, load = C.test_failure(output), C.suite_load(output)
+    E.emit("baseline", head=baseline.base[:10], totals=C.totals_line(output), timed_out=C.timed_out(output),
+           suite_seconds=load[0] if load else None)
+    if C.timed_out(output) or failure:
+        SL.revert(slot, "HEAD's own test suite fails or runs out of time")
+        R.pause(R.RUNTIME["state"], "Driver paused: the test suite fails on HEAD", f"{task_id}'s tests ran out of time, "
+                f"and so do HEAD's ({baseline.base[:10]}) with no task's changes: {(failure or output)[:200]}. "
+                f"{task_id} stays open. Make the slow tests cheaper, then send RESUME.", "urgent")
+        return None
+    took = f", {load[0]:g} s of {load[1]} s" if load else ""
+    return f" (HEAD's own suite passes: {C.totals_line(output)}{took}, so this change made a test slow or hang)"
+
+
+def record_attempt(task_id, model, outcome):
+    """Keeps what a session said at the end, with how its attempt ended, for the task's next attempt (ATTEMPTS_NOTE):
+    the last MAX_ATTEMPTS_KEPT of them, until the task lands."""
+    state = R.RUNTIME.get("state")
+    if state is None:
+        return
+    words = (R.ctx().get("last_words") or "").strip() or "(nothing)"
+    with R.STATE_LOCK:
+        kept = state.setdefault("attempts", {}).setdefault(task_id, [])
+        kept.append({"when": R.now(), "model": model, "outcome": str(outcome)[:600], "words": words[:3000]})
+        del kept[:-S.MAX_ATTEMPTS_KEPT]
+        R.write_driver_state(state)
+
+
+def attempts_note(task_id):
+    """The earlier attempts at the task, for its prompt, or ''."""
+    kept = ((R.RUNTIME.get("state") or {}).get("attempts") or {}).get(task_id) or []
+    if not kept:
+        return ""
+    lines = []
+    for item in kept:
+        words = "\n".join("  " + line for line in item["words"].splitlines())
+        lines.append(f"- {item['model']}, {item['when']}: {item['outcome']}\n  What it said at the end:\n{words}")
+    return prompts.ATTEMPTS_NOTE.format(attempts="\n".join(lines))
 
 
 def gate(slot, spec, opus, found):
@@ -113,6 +187,7 @@ def worker_attempt(slot, task_id, title, spec, model, effort, feedback):
     paused the driver), a Requeue when the checked work could not land, or the reason it failed."""
     R.log(f"worker starts: {task_id}: {title} ({model}, effort {effort or 'default'}, slot {slot.name})")
     prompt = prompts.WORKER_PROMPT.format(rules=rules_text(slot.root), task=C.task_context(spec))
+    prompt += attempts_note(task_id)
     if feedback:
         prompt += prompts.FEEDBACK_NOTE.format(model=feedback[0], reason=feedback[1],
                                                tests=X.tests_summary(R.ctx().get("last_test_output", "")))
@@ -134,6 +209,11 @@ def worker_attempt(slot, task_id, title, spec, model, effort, feedback):
     if behind:
         return Requeue(behind)
     reason, totals = check_passed(slot, spec)
+    if reason and C.timed_out(R.ctx().get("gate_output")):
+        note = suite_fault(slot, task_id)
+        if note is None:
+            return None
+        reason += note
     if reason:
         R.log(f"worker check failed: {reason}")
         held = L.refusals(SL.LEASES, slot.name)
@@ -181,6 +261,7 @@ def do_worker_task(slot, task_id, title, spec, state):
                                 (plan[index - 1][0], reason) if index else None)
         if result is None:
             return
+        record_attempt(task_id, who, f"requeued: {result}" if isinstance(result, Requeue) else f"failed: {result}")
         if isinstance(result, Requeue):
             T.requeue(slot, task_id, result, state, result.wait_for)
             return
@@ -211,6 +292,7 @@ def do_opus_task(slot, task_id, title, spec, state):
         return
     R.log(f"opus task starts: {task_id}: {title} (slot {slot.name})")
     prompt = prompts.OPUS_TASK_PROMPT.format(rules=rules_text(slot.root), task=spec)
+    prompt += attempts_note(task_id)
     if PK.is_review(task_id):
         review = PK.safe_build(task_id, spec)
         (C.LOGS / f"{task_id}.packet.{E.stamp()}.md").write_text(review, encoding="utf-8", newline="\n")
@@ -226,7 +308,13 @@ def do_opus_task(slot, task_id, title, spec, state):
         SL.revert(slot)
         return
     reason = f"Opus could not do it: {error}" if error else check_passed(slot, spec, opus=True)[0]
+    if reason and not error and C.timed_out(R.ctx().get("gate_output")):
+        note = suite_fault(slot, task_id)
+        if note is None:
+            return
+        reason += note
     if reason:
+        record_attempt(task_id, "opus", f"blocked: {reason}")
         T.block(slot, task_id, title, reason + ". Every change was undone; copies are in <logs>/revert-*.",
                 "opus_failed")
         return
