@@ -23,7 +23,7 @@ The runner gives one task at a time to a local model and watches it. Everything 
      reviewer checks it against.
    - Timers and limits: `max_minutes`, `progress_interval`, `early_progress_interval`, `stuck_check_interval`,
      `loop_idle_minutes`, `max_assists`.
-   - The driver's keys are listed in `runner/driver/loop_common.py` (`CONFIG_DEFAULTS`).
+   - The driver's keys are listed in `runner/driver/core.py` (`CONFIG_DEFAULTS`).
 3. `topic_file` points at the alerts topic file (default `~/.claude/hooks/ntfy-topic.txt`). If it is missing, nothing is sent.
    `inbox_topic_suffix` defaults to an empty string, so alerts and commands use the same topic. Set it to `-inbox` (or
    another suffix) to poll a separate commands topic.

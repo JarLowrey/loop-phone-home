@@ -1,5 +1,5 @@
 {
-  "_comment": "The driver tests' project: a Godot game laid out under game/, so every project key is exercised.",
+  "_comment": "The driver tests' project: a Godot-style project laid out under game/, so every project key is exercised.",
   "project_root": "project",
   "scope": [
     "game/src",

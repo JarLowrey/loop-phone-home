@@ -51,8 +51,10 @@ commit_digest: 4
 - `commit_digest`: landed tasks per phone message.
 
 **Task format the driver reads.** Each task has a **Files.** line (the scheduler keeps two tasks that share a file
-apart), a **Done when.** line, and optionally **Who.** Opus, **Effort.**, and **After.** naming earlier tasks it
-builds on. For a shared file, name the functions the task changes in brackets: `src/sim.py` (`end_fight`).
+apart), a **Done when.** line, and optionally **Who.** Opus or Fable (an audit, which must change nothing in the
+scope), **Effort.**, and **After.** naming earlier tasks it builds on. For a shared file, name the functions the task
+changes in brackets: `src/config.py` (`parse_config`). A session that picks a number the design does not give says so
+in a paragraph starting **Picked.**, which the driver adds to the progress file's Open questions.
 
 ## Milestone reviews with Opus
 

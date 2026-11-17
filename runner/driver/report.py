@@ -11,20 +11,26 @@ failures (blocks, requeues, escalations, failed sessions), friction inside sessi
 off, failed tool calls), pauses, pushes, and monitor runs."""
 import argparse
 import collections
+import contextlib
+import io
 import json
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import loop_common as C  # noqa: E402
+import core as C  # noqa: E402
 
-# the idle reasons scheduler.next_start() gives, by the words that start or mark them
+# the idle reasons scheduler.next_start() and mainloop give, by the words that start or mark them.
+# test_every_wait_reason_maps_to_an_idle_kind keeps this list and the reason strings from drifting apart
 IDLE_KINDS = [("runs alone", "a task that runs alone (Opus, no Files line, or requeued too often)"),
               ("waits for", "a dependency has not landed (After line, a named task, a refused file)"),
               ("shares", "the next tasks share a file with a running one"),
               ("is held by", "a file the next task needs is held by a running task"),
               ("outside the window", "the next startable task is outside parallel_window"),
-              ("no open task", "no open task is left to start")]
+              ("no open task", "no open task is left to start"),
+              ("nothing in the window can start", "nothing in the window can start"),
+              ("paused", "the driver is paused"),
+              ("over the daily budget", "the driver is over its daily budget")]
 
 
 def load(path, since=""):
@@ -93,6 +99,12 @@ def idle_time(events):
     the driver runs; a pause counts as 'paused'."""
     buckets = collections.Counter()
     slots, busy, reason, paused, last, observed = 1, set(), "", False, None, 0.0
+    # why: a window cut with --since may hold no driver_start, so the count of slots and the first moment come from
+    # what the window does hold, and the idle time is observed from its first event on
+    if events and not any(event["event"] == "driver_start" for event in events):
+        seen_slots = {event.get("slot") for event in events if event.get("slot")}
+        slots = max(1, len(seen_slots))
+        last = events[0].get("t", 0)
     for event in events:
         now = event.get("t", 0)
         if last is not None:
@@ -211,8 +223,13 @@ def report(events):
     turns = sum(event.get("turns") or 0 for event in sessions)
     print(f"Bash commands cut off by Claude Code's timeout: {timeouts}")
     print(f"tool calls refused by the task hook: {len(denials)}")
-    for denial, count in collections.Counter(denial[:90] for denial in denials).most_common(5):
-        print(f"    {count:3} x {denial}")
+    by_reason = collections.defaultdict(collections.Counter)
+    for event in sessions:
+        for denial in event.get("denials") or []:
+            by_reason[denial[:90]][event.get("task") or "?"] += 1
+    for denial, tasks in sorted(by_reason.items(), key=lambda item: -sum(item[1].values()))[:5]:
+        print(f"    {sum(tasks.values()):3} x {denial}")
+        print("          " + ", ".join(f"{count} x {task}" for task, count in tasks.most_common(5)))
     print(f"failed tool calls: {errors}; test runs by sessions: {tests}; turns: {turns}")
 
     section("Test suite time (gate runs)")
@@ -240,8 +257,17 @@ def report(events):
     print(f"pushes: {len(pushes)}, failed {sum(1 for event in pushes if not event.get('ok'))}, "
           f"slowest {max((event.get('seconds') or 0 for event in pushes), default=0):.0f} s")
     for event in (event for event in events if event["event"] == "monitor_run"):
-        print(f"  monitor run {event['time']}: clean checkout {event.get('clean')}, monitor exit "
-              f"{event.get('monitor_exit')}")
+        print(f"  monitor run {event['time']}: clean checkout {event.get('clean')}, commands "
+              f"{event.get('commands') or 'none'}, worse: {event.get('worse') or 'nothing'}")
+
+
+def report_text(since=""):
+    """The lines report() prints for --since, as one string, so a review packet can carry the driver's own numbers.
+    An audit session cannot read the logs folder, and a subprocess would run in the slot's worktree, which has no logs."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        report(load(C.LOGS / "events.jsonl", since))
+    return out.getvalue()
 
 
 def task_detail(events, task):

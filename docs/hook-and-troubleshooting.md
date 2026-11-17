@@ -57,6 +57,8 @@
 | "Driver paused: tasks keep failing" | Tasks keep being blocked, even after a triage | Read the Blocked lines in the progress file and the triage's log, fix the shared cause, then send RESUME. |
 | "slot N is not clean after its reset" | A file in the slot could not be reset (a locked file, for example) | Close what holds it, or delete the slot's folder (`slots_dir`); the driver makes it again. |
 | "Sync failed" | The push was rejected (the remote moved on) or timed out | Run `git pull --rebase` in your tree when no edit is open; the next push carries both. The driver never forces a push. |
+| "Monitor got worse" | In a fresh checkout of the main branch, the tests fail or a `monitor_commands` entry that passed before now fails | The alert names the commits since the last record; `monitor-<name>.log` in the logs folder holds the output. `python <runner>/driver --monitor --force` runs it again. |
+| "Test suite near its limit" | The test run took more than 60% of its limit (`timing_regex`) | Make the slow tests cheaper, or raise the limit, before tasks start failing their gate on time alone. |
 | "Loop stopped: session usage exhausted" | The Claude usage limit was reached during a Haiku or Opus task | Wait for the scheduled restart, or send RESUME once usage is available. If no restart time is shown, send RESUME manually. |
 | Phone gets no alert from the worker | The title is not in `phone_titles` | Add it to `phone_titles`, or set `notify_all`. The alert is still in `<id>.notify.log`. |
 

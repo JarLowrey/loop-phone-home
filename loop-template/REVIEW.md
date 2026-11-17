@@ -25,7 +25,7 @@ answer when the evidence says so.
 1. **Does it work as the design says?** Take the milestone's goal and the numbers this milestone added. Which ones does
    a test or a run show working, and which only exist in code? What do the longer checks say, against the last review's
    numbers?
-2. **What will the next milestone fight with?** For each of its tasks, the code it will touch. Which of it would it
+2. **What will the next milestone struggle with?** For each of its tasks, the code it will touch. Which of it would it
    have to restructure rather than extend, and why?
 3. **Where is one fact written twice?** The same rule, number or list in two places: two functions, code and data, a
    test and the code it tests, a constant and the design. Which copy is the one to keep?

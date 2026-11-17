@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to worker.json and fill in. Relative paths are relative to this file's folder. The worker runner reads the keys in worker_task.py DEFAULTS; the driver reads those in driver/loop_common.py CONFIG_DEFAULTS.",
+  "_comment": "Copy to worker.json and fill in. Relative paths are relative to this file's folder. The worker runner reads the keys in worker_task.py DEFAULTS; the driver reads those in driver/core.py CONFIG_DEFAULTS, which says what each is for.",
   "project_root": "/path/to/your/git/repo",
   "tasks_file": "loop/TASKS.md",
   "logs_dir": "loop/logs",
@@ -80,7 +80,9 @@
   "design_file": "",
   "fail_markers": [],
   "timing_regex": "",
-  "timeout_markers": ["TIMED OUT"],
+  "timeout_markers": [
+    "TIMED OUT"
+  ],
   "test_jobs_env": "",
   "test_one_hint": "",
   "test_files": [
@@ -93,5 +95,34 @@
   "cache_dirs": [],
   "monitor_command": [],
   "task_id_regex": "\\b([A-Z][A-Z0-9]*-[A-Z0-9]+[a-z]?)\\b",
-  "review_id_regex": "-(?:R|V\\d+)$"
+  "review_id_regex": "-(?:R|A|V\\d+)$",
+  "status_file": "loop/STATUS.md",
+  "archive_file": "loop/archive/TASKS-done.md",
+  "task_pattern": "^### \\[(.)\\] (\\S+) (.*)$",
+  "test_call_regex": "",
+  "partial_test_flags": [
+    "-k"
+  ],
+  "full_run_timeout_ms": 600000,
+  "companion_files": {},
+  "gate_checks": [
+    {
+      "name": "lint",
+      "command": [
+        "python",
+        "-m",
+        "pyflakes"
+      ],
+      "paths": [
+        "src/*.py",
+        "tests/*.py"
+      ],
+      "pass_paths": true,
+      "timeout": 300,
+      "fail_regex": ""
+    }
+  ],
+  "blind_outputs": {},
+  "monitor_commands": [],
+  "monitor_schedule_hour": "03:00"
 }

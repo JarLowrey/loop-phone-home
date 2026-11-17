@@ -2,6 +2,7 @@
 import json
 import os
 import pathlib
+import secrets
 import subprocess
 import sys
 import threading
@@ -9,49 +10,74 @@ import time
 from contextlib import contextmanager
 
 import budget as B
-import events as E
-import loop_common as C
-import runtime as R
-import settings as S
+import core as C
 import slots as SL
+import task_hook
 
 # the phone's command handler; commands.py sets it, so this module need not import that one
 HANDLE_COMMANDS = None
 TASK_HOOK = pathlib.Path(__file__).resolve().parent / "task_hook.py"
 # the tools the task hook checks: all of them, since past its deadline it refuses every call
 HOOKED_TOOLS = "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep"
-# why: a session killed at its time limit leaves no last message, and one such kill lost a whole diagnosis; from this
-# many seconds before the limit the task hook refuses every tool call, so the session ends by writing what it found
+# why: a session killed at its time limit leaves no last message, so the diagnosis it had made is lost; from this many
+# seconds before the limit the task hook refuses every tool call, so the session ends by writing what it found
 WRAP_UP_SECONDS = 300
-# why: Claude Code moves a Bash command to the background after 2 minutes, and a test run with two slots takes 110 s or
-# more, so a session's own test runs were cut off and polled; 10 minutes covers a run under load
+# why: Claude Code moves a Bash command to the background after 2 minutes, and a test run with two slots can take
+# longer, so a session's own test runs were cut off and polled; 10 minutes covers a run under load
 BASH_TIMEOUT_MS = "600000"
 # words in a tool result that mean the task hook refused the call, or Claude Code backgrounded a slow command
-DENIAL_MARKERS = ("cd is refused", "another copy of the project", "This session works in its own copy")
+DENIAL_MARKERS = ("cd is refused", "another copy of the project", "This session works in its own copy",
+                  "A full test run already passed")
 BASH_TIMEOUT_MARKER = "did not complete within"
 
 
-def task_settings(slot=None, deadline=0.0):
-    """The --settings of a task session: the task hook, with its slot's root, lease file, the trees it must not touch
-    and the time from which it refuses every call. Passed with --settings, so only the driver's sessions get it, not
-    the owner's own."""
-    command = f'"{sys.executable}" "{TASK_HOOK}"'
-    if deadline:
-        command += f" --deadline {deadline:.0f}"
+def receipt_key(slot):
+    """The key a slot's session signs its test receipt with, made the first time and kept for the driver's run; ''
+    without a slot."""
+    if slot is None:
+        return ""
+    return C.RUNTIME.setdefault("receipt_keys", {}).setdefault(slot.name, secrets.token_hex(16))
+
+
+def receipt_path(slot):
+    """Where the task hook writes the slot's test receipt: the main tree's logs, which the session cannot write."""
+    return C.LOGS / f"receipt-{slot.name}.json"
+
+
+def hook_args(slot, deadline):
+    """The task hook's arguments for one session, which task_settings writes to a JSON file."""
+    found = {"started": time.time(), "deadline": deadline, "logs": C.LOGS_REL,
+             "test_call": C.TEST_CALL.pattern, "partial": list(C.CFG.partial_test_flags),
+             "full_timeout_ms": int(C.CFG.full_run_timeout_ms or 0),
+             "no_whole_read": [path for path in (C.TASKS_REL, C.PROGRESS_REL) if path],
+             "scope": list(C.SCOPE), "totals_marker": C.CFG.totals_marker, "pass_marker": C.CFG.pass_marker,
+             "fail_marker": list(C.CFG.fail_markers or [])}
     if slot is not None:
-        command += f' --root "{slot.root}" --slot {slot.name} --leases "{SL.LEASES}" --logs "{C.CFG.logs_dir}"'
-        command += "".join(f' --forbid "{tree}"' for tree in SL.other_roots(slot))
-    return json.dumps({"env": {"BASH_DEFAULT_TIMEOUT_MS": BASH_TIMEOUT_MS, "BASH_MAX_TIMEOUT_MS": BASH_TIMEOUT_MS,
-                               **test_env()},
-                       "hooks": {"PreToolUse": [{"matcher": HOOKED_TOOLS, "hooks": [
-                           {"type": "command", "command": command, "timeout": 10}]}]}})
+        found.update(root=str(slot.root), slot=slot.name, leases=str(SL.LEASES),
+                     forbid=[str(tree) for tree in SL.other_roots(slot)], receipt=str(receipt_path(slot)))
+    else:
+        found["root"] = str(C.PROJECT)
+    return found
 
 
-def kill_tree(pid):
-    """Kills a process and everything it started, so no session is left behind."""
-    if pid:
-        C.kill_tree(pid)
-        R.log(f"killed process tree {pid}")
+def task_settings(slot=None, deadline=0.0):
+    """The --settings of a task session: the task hook before every tool call, and after every Bash call to write the
+    slot's test receipt, with the session's arguments in <logs>/hook-<slot>.json. Passed with --settings, so only the
+    driver's sessions get it, not the owner's own. A new session's slot starts without a receipt."""
+    name = slot.name if slot is not None else "main"
+    config = C.LOGS / f"hook-{name}.json"
+    C.LOGS.mkdir(parents=True, exist_ok=True)
+    config.write_text(json.dumps(hook_args(slot, deadline), indent=1), encoding="utf-8", newline="\n")
+    if slot is not None:
+        receipt_path(slot).unlink(missing_ok=True)
+    command = f'"{sys.executable}" "{TASK_HOOK}" --config "{config}"'
+    env = {"BASH_DEFAULT_TIMEOUT_MS": BASH_TIMEOUT_MS, "BASH_MAX_TIMEOUT_MS": BASH_TIMEOUT_MS, **test_env()}
+    if slot is not None:
+        env[task_hook.RECEIPT_KEY_ENV] = receipt_key(slot)
+    return json.dumps({"env": env, "hooks": {
+        "PreToolUse": [{"matcher": HOOKED_TOOLS, "hooks": [{"type": "command", "command": command, "timeout": 10}]}],
+        "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": command + " --post",
+                                                      "timeout": 60}]}]}})
 
 
 @contextmanager
@@ -73,24 +99,27 @@ def polling():
 def poll_while(stop):
     """Runs in its own thread while a session or test run runs: answers the phone's commands every POLL_SECONDS. SHUTDOWN
     NOW ends the whole driver from here."""
-    while not stop.wait(S.POLL_SECONDS):
+    while not stop.wait(C.POLL_SECONDS):
         try:
-            HANDLE_COMMANDS(R.RUNTIME["state"])
-            R.write_driver_state(R.RUNTIME["state"])
+            HANDLE_COMMANDS(C.RUNTIME["state"])
+            C.write_driver_state(C.RUNTIME["state"])
         except SystemExit:
-            R.DRIVER_PID.unlink(missing_ok=True)
-            R.log("driver ended by SHUTDOWN NOW")
+            C.DRIVER_PID.unlink(missing_ok=True)
+            C.log("driver ended by SHUTDOWN NOW")
             os._exit(0)
         except Exception as error:
-            R.log(f"command poll failed: {error}")
+            C.log(f"command poll failed: {error}")
+
+
+def test_jobs():
+    """How many processes one test run may use: the CPUs shared out among the slots and the monitor, 2 to 8, so runs
+    at the same time do not starve each other into timeouts."""
+    return str(max(2, min(8, (os.cpu_count() or 4) // (max(1, C.PARALLEL_SLOTS) + 1))))
 
 
 def test_env():
-    """{test_jobs_env: how many processes one test run may use}: the CPUs shared out among the slots, 2 to 8, so
-    slots that test at once do not starve each other. Empty without test_jobs_env in the config."""
-    if not C.CFG.test_jobs_env:
-        return {}
-    return {C.CFG.test_jobs_env: str(max(2, min(8, (os.cpu_count() or 4) // max(1, S.PARALLEL_SLOTS))))}
+    """The environment a test run gets: test_jobs() in the variable test_jobs_env names, or nothing."""
+    return {C.CFG.test_jobs_env: test_jobs()} if C.CFG.test_jobs_env else {}
 
 
 def run_tests(root=None):
@@ -99,11 +128,13 @@ def run_tests(root=None):
         return C.test_output(root=root, env=test_env())
 
 
-def tests_summary(output):
-    """The failures and the totals of a test run's output, for a retry's feedback: the lines that say fail or error, and
-    the totals line."""
-    keep = [line for line in (output or "").splitlines()
-            if "fail" in line.lower() or "error" in line.lower() or C.CFG.totals_marker in line]
+def tests_summary(output=None):
+    """The failures and totals of a test run's output (the task's last one by default), for a retry's feedback."""
+    output = output if output is not None else (C.ctx().get("last_test_output") or C.ctx().get("gate_output") or "")
+    marks = tuple(C.CFG.fail_markers or ()) + ("FAIL", "Error", "ERROR")
+    keep = [line for line in output.splitlines()
+            if C.CFG.totals_marker in line or any(mark in line for mark in marks)
+            or (C.FAILURE is not None and C.FAILURE.search(line))]
     return "\n".join(keep[-60:]) or "(no test output)"
 
 
@@ -156,7 +187,8 @@ class SessionStats:
             if part.get("type") == "tool_use":
                 name = str(part.get("name"))
                 self.tools[name] = self.tools.get(name, 0) + 1
-                if name == "Bash" and C.TEST_MARKER in json.dumps(part.get("input")):
+                command = str((part.get("input") or {}).get("command", ""))
+                if name == "Bash" and task_hook.runs_tests(command, C.TEST_CALL.pattern):
                     self.test_runs += 1
             elif part.get("type") == "tool_result":
                 text = json.dumps(part.get("content")) if not isinstance(part.get("content"), str) else part["content"]
@@ -171,7 +203,7 @@ class SessionStats:
 def session_event(stats, result, model, effort, kind, seconds, raw_log):
     """Records one session in events.jsonl: its cost, tokens, why it ended and what it did."""
     usage = result.get("usage") or {}
-    E.emit("session", model=model, effort=effort, kind=kind, seconds=seconds, turns=result.get("num_turns"),
+    C.emit("session", model=model, effort=effort, kind=kind, seconds=seconds, turns=result.get("num_turns"),
            cost_usd=result.get("total_cost_usd"), is_error=bool(result.get("is_error")) or not result,
            subtype=result.get("subtype"), terminal_reason=result.get("terminal_reason"),
            tokens_in=usage.get("input_tokens"), tokens_out=usage.get("output_tokens"),
@@ -182,8 +214,8 @@ def session_event(stats, result, model, effort, kind, seconds, raw_log):
 
 def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, slot=None):
     """Runs one Claude session with tools, in its slot's worktree (the main tree without one). Each step is logged as it
-    happens, and the raw stream is kept in <logs>/<task>.<kind>.<model>.<time>.jsonl, one file per session, so a
-    retry or a requeue never overwrites an earlier attempt's. Returns (text, error); one of them is empty."""
+    happens, and the raw stream is kept in <logs>/<task>.<kind>.<model>.<time>.jsonl, one file per session, so a retry
+    or a requeue never overwrites an earlier attempt's. Returns (text, error); one of them is empty."""
     command = [C.CLAUDE, "-p", "--model", model, "--tools", "Bash,Read,Edit,Write,Glob,Grep",
                "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep",
                "--disallowedTools", *C.DISALLOWED_TOOLS, "--disable-slash-commands", "--strict-mcp-config",
@@ -196,8 +228,8 @@ def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, sl
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                cwd=slot.root if slot is not None else C.PROJECT, env=C.helper_env(), text=True,
                                encoding="utf-8", errors="replace", bufsize=1)
-    R.CHILDREN[key] = process.pid
-    timer = threading.Timer(timeout, kill_tree, args=(process.pid,))
+    C.CHILDREN[key] = process.pid
+    timer = threading.Timer(timeout, C.kill_tree, args=(process.pid,))
     timer.start()
     process.stdin.write(prompt)
     process.stdin.close()
@@ -206,8 +238,8 @@ def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, sl
     result = {}
     texts = []
     stats = SessionStats()
-    raw_log = C.LOGS / f"{task_id}.{kind}.{model}.{E.stamp()}.jsonl"
-    R.ctx()["session_log"] = raw_log.name
+    raw_log = C.LOGS / f"{task_id}.{kind}.{model}.{C.stamp()}.jsonl"
+    C.ctx()["session_log"] = raw_log.name
     try:
         with polling(), open(raw_log, "w", encoding="utf-8", newline="\n") as raw:
             for line in process.stdout:
@@ -215,7 +247,7 @@ def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, sl
                 try:
                     event = json.loads(line)
                 except ValueError:
-                    R.log(f"{model} output: {line.rstrip()[:200]}")
+                    C.log(f"{model} output: {line.rstrip()[:200]}")
                     continue
                 stats.read(event)
                 for part, value in event_parts(event):
@@ -223,31 +255,35 @@ def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, sl
                         result = value
                     elif part == "say":
                         texts.append(value)
-                        R.log(f"{model} says: {value[:200]}")
+                        C.log(f"{model} says: {value[:200]}")
                     elif part == "step":
                         steps += 1
-                        R.log(f"{model} step {steps}: {value}")
+                        C.log(f"{model} step {steps}: {value}")
                     elif part == "tool_result":
-                        R.log(f"{model} tool result: {value}")
+                        C.log(f"{model} tool result: {value}")
                     else:
-                        R.log(f"{model} {value[:200]}")
+                        C.log(f"{model} {value[:200]}")
             code = process.wait()
     finally:
-        R.CHILDREN.pop(key, None)
+        if process.poll() is None:
+            # why: an error while reading the stream skips process.wait(), and a session left running goes on editing
+            # its slot after the driver has undone that slot and moved on, so the next task begins on its work
+            C.kill_tree(process.pid)
+        C.CHILDREN.pop(key, None)
         timer.cancel()
         B.release_reservation()
     seconds = round(time.time() - started)
-    R.ctx()["last_session"] = {"turns": result.get("num_turns") or 0, "seconds": seconds, "steps": steps}
-    R.ctx()["last_words"] = str(result.get("result") or "").strip() or "\n\n".join(texts[-3:])[-3000:]
+    C.ctx()["last_session"] = {"turns": result.get("num_turns") or 0, "seconds": seconds, "steps": steps}
+    C.ctx()["last_words"] = str(result.get("result") or "").strip() or "\n\n".join(texts[-3:])[-3000:]
     session_event(stats, result, model, effort, kind, seconds, raw_log)
     if stats.bash_timeouts:
-        R.log(f"{model}: {stats.bash_timeouts} Bash command(s) ran past Claude Code's timeout and went to the background")
+        C.log(f"{model}: {stats.bash_timeouts} Bash command(s) ran past Claude Code's timeout and went to the background")
     if result:
         C.log_usage({"task": task_id, "who": model, "kind": kind, "effort": effort,
                      "slot": slot.name if slot is not None else "", "is_error": bool(result.get("is_error")),
                      "turns": result.get("num_turns"), "seconds": seconds,
                      "cost_usd": result.get("total_cost_usd"), "usage": result.get("usage")})
-        R.log(f"{model} finished in {seconds} s: {result.get('num_turns')} turns, cost {result.get('total_cost_usd')} "
+        C.log(f"{model} finished in {seconds} s: {result.get('num_turns')} turns, cost {result.get('total_cost_usd')} "
               f"USD, error {bool(result.get('is_error'))}, {result.get('subtype', '')}")
     if not result or result.get("is_error") or not result.get("result"):
         return "", failure_text(model, code, seconds, result, texts)
@@ -256,7 +292,8 @@ def run_session(prompt, task_id, model, effort, turns, timeout, budget, kind, sl
 
 def failure_text(model, code, seconds, result, texts=()):
     """Why a session failed, in one line. A session stopped by a limit (max_turns, a budget) says which, with its turns,
-    since its result text is often empty and "exit 1" alone reads as a crash."""
+    since its result text is often empty and "exit 1" alone reads as a crash. A session killed with no result gives
+    its last words instead."""
     detail = str(result.get("result") or result.get("subtype") or "no result")[:300]
     reason = result.get("terminal_reason") or ""
     stopped = f", stopped by {reason} after {result.get('num_turns')} turns" if reason and reason != "completed" else ""

@@ -54,10 +54,15 @@ flowchart TD
 - **Side by side, safely.** `parallel_slots` tasks run at once. A task waits while a running task holds one of its files
   (its **Files.** line, plus files its session takes), names it, or is named by its **After.** line. A hook refuses a
   session's edits to another slot's files. Reviews, other **Who.** Opus tasks and escalations run alone.
-- **Only checked work lands.** The driver runs the tests itself and checks the scope, removed or weakened tests, and
-  the task's **Done when.** line. Work that landed meanwhile is merged in and tested again before anything lands.
+- **Only checked work lands.** The driver checks the scope, removed or weakened tests, companion files, your
+  `gate_checks` and the task's **Done when.** line, and the tests pass. It runs them itself, unless the session's own
+  full run left a signed receipt for exactly the tree in the slot. Work that landed meanwhile is merged in and tested
+  again before anything lands.
 - **It looks after itself.** A supervisor restarts it after a crash; it pauses at the usage limit or the daily budget
-  and resumes on its own; blocks in a row start an Opus triage; every few landings a fresh checkout is tested. A test
+  and resumes on its own; blocks in a row start an Opus triage, and the blocked tasks open again once its fix lands;
+  every few landings, and nightly with `--install-monitor-schedule`, a fresh checkout is tested and your
+  `monitor_commands` run, with an alert when one that passed starts failing. A commit to the driver's own code
+  restarts it on that code. A test
   run that times out is checked against the branch's own suite, so a slow suite pauses the loop instead of failing
   tasks, and what each attempt found is handed to the next one.
 
@@ -76,12 +81,15 @@ flowchart TD
    | `scope` | Folders a task may change, e.g. `["src", "tests"]` |
    | `test_command` | Runs the tests from the tree's root; must print a line with `totals_marker` and `pass_marker` |
    | `test_files` | Globs of the test files, for the removed-test and weakened-test checks |
-   | `tasks_file`, `progress_file`, `loop_file`, `rules_file`, `design_file` | The loop's files |
+   | `partial_test_flags`, `full_run_timeout_ms` | Words that make a test call less than the full suite, and the Bash timeout a full run needs |
+   | `tasks_file`, `progress_file`, `status_file`, `loop_file`, `rules_file`, `design_file` | The loop's files |
    | `slot_files`, `cache_dirs` | Per-slot files (a tool's per-project data folder) and caches a fresh clone lacks |
-   | `monitor_command` | Optional longer check (a benchmark, a bot) run every `monitor_every` landings |
+   | `companion_files` | Files that must land together, by suffix: `{".gd": ".uid"}` |
+   | `gate_checks` | More checks the gate runs on a task's changed files: a linter, a style check, another suite |
+   | `monitor_command`, `monitor_commands` | Optional longer checks (a benchmark, an end-to-end run) on a clean checkout every `monitor_every` landings |
    | `sync` | Push after each landing |
 
-   Every key the driver reads is in `runner/driver/loop_common.py` (`CONFIG_DEFAULTS`).
+   Every key the driver reads is in `runner/driver/core.py` (`CONFIG_DEFAULTS`), with what it is for.
 4. **The loop file.** Copy `loop-template/LOOP.md` into your project (at `loop_file`); its `driver-settings` block holds
    the settings you change while it runs: `parallel_slots`, `daily_budget_usd`, `approvals`, `commit_digest`, ...
 5. **Tasks.** Each `### [ ] <id> <title>` heading in the task file is a task, with a **Files.** and a **Done when.**
@@ -94,9 +102,14 @@ From the folder that holds `worker.json`:
 | Command | What it does |
 |---|---|
 | `python runner/driver` | Starts the driver under its supervisor |
-| `python runner/driver/check_driver.py` | Is it running, on what, and its last log lines |
-| `python runner/driver/simulate.py` | What `parallel_slots` and `parallel_window` would do to your queue |
-| `python runner/driver/report.py` | Where the time and money went: phases, idle slots by reason, failures, friction |
+| `python runner/driver --check` | Is it running, from which commit, on what, and its last log lines |
+| `python runner/driver --status` | Rewrites and prints the status file: what is left, blocked and done |
+| `python runner/driver --lint-tasks` | Every fault the gate would find in the open tasks' Files and Done when lines |
+| `python runner/driver --tidy` | Moves landed task specs from the task file to the archive file |
+| `python runner/driver --simulate` | What `parallel_slots` and `parallel_window` would do to your queue |
+| `python runner/driver --report` | Where the time and money went: phases, idle slots by reason, failures, friction |
+| `python runner/driver --monitor` | The monitor on the main branch's last commit, unless it has a record already |
+| `python runner/driver --install-monitor-schedule` | Runs `--monitor` each night (Windows), or prints a crontab line |
 | `python runner/driver --shutdown` | Stops everything now; unfinished work in the slots is undone |
 | `python runner/driver --install-autostart` | Starts it at each logon (Windows), or prints a crontab line |
 
@@ -106,7 +119,8 @@ the running tasks), `SHUTDOWN NOW`, `MODEL <haiku|sonnet|opus|fable> [effort]`, 
 
 **Logs**, in `logs_dir`: `events.jsonl` (every phase of every task, timed: what `report.py` reads), `driver.log` (every
 decision, in words), `usage.jsonl` (every session's tokens and cost), each session's stream and each gate's test
-output in files of their own, and `revert-*/` folders (undone work, with a `REASON.txt`).
+output in files of their own, `monitor-history.jsonl` (one record a monitor run), and `revert-*/` folders (undone
+work, with a `REASON.txt`).
 
 ## Safety
 
